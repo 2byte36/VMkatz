@@ -26,12 +26,15 @@ impl<'a> EprocessReader<'a> {
     pub fn read_image_name(&self, phys: &impl PhysicalMemory, eprocess_phys: u64) -> Result<String> {
         let mut buf = [0u8; 15];
         phys.read_phys(eprocess_phys + self.offsets.image_file_name, &mut buf)?;
-        let name = buf
+        // ImageFileName is null-terminated ASCII; filter to printable bytes
+        // to avoid garbage characters (e.g. PID 0 Idle process has 0xFF fill)
+        let name: String = buf
             .iter()
             .take_while(|&&b| b != 0)
-            .copied()
-            .collect::<Vec<u8>>();
-        Ok(String::from_utf8_lossy(&name).to_string())
+            .filter(|&&b| b.is_ascii_graphic() || b == b' ' || b == b'.')
+            .map(|&b| b as char)
+            .collect();
+        Ok(name)
     }
 
     /// Read the ActiveProcessLinks.Flink from an EPROCESS at the given physical address.

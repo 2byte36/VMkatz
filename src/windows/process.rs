@@ -168,14 +168,7 @@ pub fn enumerate_processes(
             }
         };
 
-        let name = reader
-            .read_image_name(phys, eprocess_phys)
-            .unwrap_or_else(|_| "<unknown>".to_string());
-
-        let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
-        let peb = reader.read_peb(phys, eprocess_phys).unwrap_or(0);
-
-        // Read next Flink
+        // Read next Flink before potentially skipping this entry
         let next_flink = match reader.read_flink(phys, eprocess_phys) {
             Ok(f) => f,
             Err(e) => {
@@ -184,13 +177,23 @@ pub fn enumerate_processes(
             }
         };
 
-        processes.push(Process {
-            pid,
-            name,
-            dtb,
-            eprocess_phys,
-            peb_vaddr: peb,
-        });
+        // Skip PID 0 (System Idle Process) - has no valid DTB, PEB, or name
+        if pid != 0 {
+            let name = reader
+                .read_image_name(phys, eprocess_phys)
+                .unwrap_or_else(|_| "<unknown>".to_string());
+
+            let dtb = reader.read_dtb(phys, eprocess_phys).unwrap_or(0);
+            let peb = reader.read_peb(phys, eprocess_phys).unwrap_or(0);
+
+            processes.push(Process {
+                pid,
+                name,
+                dtb,
+                eprocess_phys,
+                peb_vaddr: peb,
+            });
+        }
 
         current_flink = next_flink;
     }
