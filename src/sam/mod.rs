@@ -1059,6 +1059,18 @@ fn scan_vmdk_grains_for_hives(
         }
     }
 
+    // If SYSTEM hive is too small, save it as fallback but allow Phase 2c to try
+    // assembling a more complete hive from scattered hbin blocks.
+    let mut small_system_fallback: Option<Vec<u8>> = None;
+    if system_data.as_ref().is_some_and(|d| (d.len() as u64) < MIN_SYSTEM_HIVE_SIZE) {
+        log::info!(
+            "SYSTEM hive only {} bytes (< {} minimum), will try fragmented assembly",
+            system_data.as_ref().unwrap().len(),
+            MIN_SYSTEM_HIVE_SIZE,
+        );
+        small_system_fallback = system_data.take();
+    }
+
     match (sam_data, system_data) {
         (Some(sam), Some(system)) => return Ok((sam, system, security_data)),
         (s, sys) => { sam_data = s; system_data = sys; }
@@ -1148,6 +1160,17 @@ fn scan_vmdk_grains_for_hives(
                     *target = Some(hive_data);
                 }
             }
+        }
+    }
+
+    // Restore small SYSTEM fallback if Phase 2c didn't find a better one
+    if system_data.is_none() {
+        if let Some(small) = small_system_fallback {
+            log::info!(
+                "Using small SYSTEM hive fallback ({} bytes) from Phase 2b",
+                small.len(),
+            );
+            system_data = Some(small);
         }
     }
 
@@ -1551,7 +1574,12 @@ fn validate_hive_content(name: &str, hbin_data: &[u8]) -> bool {
         return false;
     }
     match rname.as_str() {
-        "SYSTEM" => root.subkey(&h, "Select").is_ok(),
+        // Accept SYSTEM if Select OR any ControlSet is accessible
+        "SYSTEM" => {
+            root.subkey(&h, "Select").is_ok()
+                || root.subkey(&h, "ControlSet001").is_ok()
+                || root.subkey(&h, "ControlSet002").is_ok()
+        }
         "SAM" => root.subkey(&h, "Domains").is_ok(),
         "SECURITY" => root.subkey(&h, "Policy").is_ok(),
         _ => false,
@@ -1658,7 +1686,11 @@ fn build_hive_from_hbins(
         return None;
     }
     let strict = match rname.as_str() {
-        "SYSTEM" => root.subkey(&h, "Select").is_ok(),
+        "SYSTEM" => {
+            root.subkey(&h, "Select").is_ok()
+                || root.subkey(&h, "ControlSet001").is_ok()
+                || root.subkey(&h, "ControlSet002").is_ok()
+        }
         "SAM" => root.subkey(&h, "Domains").is_ok(),
         "SECURITY" => root.subkey(&h, "Policy").is_ok(),
         _ => false,
