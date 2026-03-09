@@ -5,8 +5,11 @@ use std::path::Path;
 use ntfs::attribute_value::NtfsAttributeValue;
 
 use crate::disk::{self, DiskImage};
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use crate::paging::entry::PageTableEntry;
+
+/// Maximum number of pagefiles Windows supports (0-15).
+const MAX_PAGEFILES: usize = 16;
 
 /// Pre-built data run map entry mapping pagefile byte ranges to absolute disk positions.
 struct PagefileDataRun {
@@ -15,57 +18,97 @@ struct PagefileDataRun {
     length: u64,
 }
 
-/// Reads pages from pagefile.sys on a virtual disk image.
-///
-/// Pre-extracts NTFS data runs at construction time to avoid keeping ntfs crate
-/// types alive (which would create self-referential struct issues). Uses RefCell
-/// for interior mutability since read_virt(&self) is immutable but disk seeks need &mut.
-pub struct PagefileReader {
-    disk: RefCell<Box<dyn DiskImage>>,
+/// Per-file state for a single pagefile (pagefile.sys, pagefile2.sys, etc.).
+struct SinglePagefile {
     data_runs: Vec<PagefileDataRun>,
     pagefile_size: u64,
+}
+
+/// Reads pages from Windows pagefiles on a virtual disk image.
+///
+/// Supports up to 16 pagefiles (pagefile.sys as #0, pagefile2.sys through
+/// pagefile16.sys as #1-15). Pre-extracts NTFS data runs at construction time
+/// to avoid keeping ntfs crate types alive (which would create self-referential
+/// struct issues). Uses RefCell for interior mutability since read_virt(&self)
+/// is immutable but disk seeks need &mut.
+pub struct PagefileReader {
+    disk: RefCell<Box<dyn DiskImage>>,
+    pagefiles: Vec<Option<SinglePagefile>>,  // indexed by pagefile number (0-15)
     pages_resolved: std::cell::Cell<u64>,
 }
 
 impl PagefileReader {
-    /// Open pagefile.sys from a disk image, extracting its NTFS data runs.
+    /// Open pagefiles from a disk image, extracting NTFS data runs.
+    ///
+    /// The primary pagefile.sys (#0) is required. Secondary pagefiles
+    /// (pagefile2.sys through pagefile16.sys, #1-15) are optional and
+    /// extremely rare in practice.
     pub fn open(disk_path: &Path) -> Result<Self> {
         let mut disk = disk::open_disk(disk_path)?;
-        let (data_runs, pagefile_size) = extract_pagefile_data_runs(&mut disk)?;
 
+        // Primary pagefile.sys is required
+        let primary = extract_named_pagefile_data_runs(&mut disk, "pagefile.sys")?;
         log::info!(
-            "Pagefile: {:.1} MB, {} data runs",
-            pagefile_size as f64 / (1024.0 * 1024.0),
-            data_runs.len()
+            "Pagefile #0: {:.1} MB, {} data runs",
+            primary.pagefile_size as f64 / (1024.0 * 1024.0),
+            primary.data_runs.len()
         );
+
+        let mut pagefiles: Vec<Option<SinglePagefile>> = Vec::with_capacity(MAX_PAGEFILES);
+        pagefiles.push(Some(primary));
+
+        // Try secondary pagefiles #1-15 (optional)
+        for i in 1..MAX_PAGEFILES {
+            let filename = format!("pagefile{}.sys", i + 1);
+            match extract_named_pagefile_data_runs(&mut disk, &filename) {
+                Ok(pf) => {
+                    log::info!(
+                        "Pagefile #{}: {:.1} MB, {} data runs ({})",
+                        i,
+                        pf.pagefile_size as f64 / (1024.0 * 1024.0),
+                        pf.data_runs.len(),
+                        filename
+                    );
+                    pagefiles.push(Some(pf));
+                }
+                Err(e) => {
+                    log::debug!("No {}: {}", filename, e);
+                    pagefiles.push(None);
+                }
+            }
+        }
 
         Ok(Self {
             disk: RefCell::new(disk),
-            data_runs,
-            pagefile_size,
+            pagefiles,
             pages_resolved: std::cell::Cell::new(0),
         })
     }
 
+    /// Total size across all open pagefiles.
     pub fn pagefile_size(&self) -> u64 {
-        self.pagefile_size
+        self.pagefiles
+            .iter()
+            .filter_map(|pf| pf.as_ref())
+            .map(|pf| pf.pagefile_size)
+            .sum()
     }
 
     pub fn pages_resolved(&self) -> u64 {
         self.pages_resolved.get()
     }
 
-    /// Read a 4KB page from the pagefile at the given byte offset.
-    pub fn read_page(&self, byte_offset: u64) -> Result<[u8; 4096]> {
-        if byte_offset + 4096 > self.pagefile_size {
-            return Err(GovmemError::DecryptionError(format!(
+    /// Read a 4KB page from the specified pagefile's data runs.
+    fn read_page_internal(&self, pf: &SinglePagefile, byte_offset: u64) -> Result<[u8; 4096]> {
+        if byte_offset + 4096 > pf.pagefile_size {
+            return Err(VmkatzError::DecryptionError(format!(
                 "Pagefile offset 0x{:x} + 4096 exceeds size 0x{:x}",
-                byte_offset, self.pagefile_size
+                byte_offset, pf.pagefile_size
             )));
         }
 
         // Binary search for the data run containing this offset
-        let idx = match self.data_runs.binary_search_by(|run| {
+        let idx = match pf.data_runs.binary_search_by(|run| {
             if byte_offset < run.file_offset {
                 std::cmp::Ordering::Greater
             } else if byte_offset >= run.file_offset + run.length {
@@ -81,7 +124,7 @@ impl PagefileReader {
             }
         };
 
-        let run = &self.data_runs[idx];
+        let run = &pf.data_runs[idx];
         let run_offset = byte_offset - run.file_offset;
         let disk_pos = run.disk_offset + run_offset;
 
@@ -94,66 +137,73 @@ impl PagefileReader {
         Ok(buf)
     }
 
-    /// Resolve a pagefile PTE: check if it points to pagefile #0 and read the page.
+    /// Resolve a pagefile PTE: route to the correct pagefile by number and read the page.
     pub fn resolve_pte(&self, raw_pte: u64) -> Option<[u8; 4096]> {
         let pte = PageTableEntry(raw_pte);
-        if !pte.is_pagefile() || pte.pagefile_number() != 0 {
+        if !pte.is_pagefile() {
             return None;
         }
-        self.read_page(pte.pagefile_offset()).ok()
+        let pf_num = pte.pagefile_number() as usize;
+        let pf = self.pagefiles.get(pf_num)?.as_ref()?;
+        self.read_page_internal(pf, pte.pagefile_offset()).ok()
     }
 }
 
-/// Extract pagefile.sys data runs from the disk image.
-fn extract_pagefile_data_runs(
+/// Extract data runs for a named pagefile from the disk image.
+///
+/// Searches all NTFS partitions for the given filename (e.g. "pagefile.sys",
+/// "pagefile2.sys") in the root directory.
+fn extract_named_pagefile_data_runs(
     disk: &mut Box<dyn DiskImage>,
-) -> Result<(Vec<PagefileDataRun>, u64)> {
+    filename: &str,
+) -> Result<SinglePagefile> {
     let partitions = crate::sam::find_ntfs_partitions(disk)?;
 
     for &partition_offset in &partitions {
-        match try_extract_from_partition(disk, partition_offset) {
+        match try_extract_from_partition(disk, partition_offset, filename) {
             Ok(result) => return Ok(result),
             Err(e) => {
-                log::debug!("No pagefile at partition 0x{:x}: {}", partition_offset, e);
+                log::debug!("No {} at partition 0x{:x}: {}", filename, partition_offset, e);
             }
         }
     }
 
-    Err(GovmemError::DecryptionError(
-        "pagefile.sys not found on any NTFS partition".to_string(),
+    Err(VmkatzError::DecryptionError(
+        format!("{} not found on any NTFS partition", filename),
     ))
 }
 
-/// Try to extract pagefile.sys data runs from a specific NTFS partition.
+/// Try to extract pagefile data runs from a specific NTFS partition.
 fn try_extract_from_partition(
     disk: &mut Box<dyn DiskImage>,
     partition_offset: u64,
-) -> Result<(Vec<PagefileDataRun>, u64)> {
+    filename: &str,
+) -> Result<SinglePagefile> {
     let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
 
     let ntfs = ntfs::Ntfs::new(&mut part_reader)
-        .map_err(|e| GovmemError::DecryptionError(format!("NTFS parse error: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("NTFS parse error: {}", e)))?;
 
     let root = ntfs
         .root_directory(&mut part_reader)
-        .map_err(|e| GovmemError::DecryptionError(format!("NTFS root dir error: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root dir error: {}", e)))?;
 
-    let pagefile = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "pagefile.sys")?;
+    let pagefile_entry = crate::sam::find_entry(&ntfs, &root, &mut part_reader, filename)?;
 
-    let data_item = pagefile
+    let data_item = pagefile_entry
         .data(&mut part_reader, "")
         .ok_or_else(|| {
-            GovmemError::DecryptionError("pagefile.sys: no $DATA attribute".to_string())
+            VmkatzError::DecryptionError(format!("{}: no $DATA attribute", filename))
         })?
-        .map_err(|e| GovmemError::DecryptionError(format!("pagefile.sys $DATA error: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("{} $DATA error: {}", filename, e)))?;
 
     let data_attr = data_item.to_attribute().map_err(|e| {
-        GovmemError::DecryptionError(format!("pagefile.sys to_attribute error: {}", e))
+        VmkatzError::DecryptionError(format!("{} to_attribute error: {}", filename, e))
     })?;
 
     let data_value = data_attr
         .value(&mut part_reader)
-        .map_err(|e| GovmemError::DecryptionError(format!("pagefile.sys value error: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("{} value error: {}", filename, e)))?;
 
     let pagefile_size = data_value.len();
 
@@ -165,7 +215,7 @@ fn try_extract_from_partition(
 
             for run_result in nr.data_runs() {
                 let run = run_result.map_err(|e| {
-                    GovmemError::DecryptionError(format!("pagefile.sys data run error: {}", e))
+                    VmkatzError::DecryptionError(format!("{} data run error: {}", filename, e))
                 })?;
 
                 let allocated = run.allocated_size();
@@ -181,10 +231,10 @@ fn try_extract_from_partition(
                 cumulative_offset += allocated;
             }
 
-            Ok((runs, pagefile_size))
+            Ok(SinglePagefile { data_runs: runs, pagefile_size })
         }
-        _ => Err(GovmemError::DecryptionError(
-            "pagefile.sys: $DATA is not non-resident (unexpected for a pagefile)".to_string(),
+        _ => Err(VmkatzError::DecryptionError(
+            format!("{}: $DATA is not non-resident (unexpected for a pagefile)", filename),
         )),
     }
 }

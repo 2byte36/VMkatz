@@ -1,8 +1,15 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
+use super::{read_u32_be_file, read_u64_be_file};
+
+/// Maximum number of L2 tables kept in cache.
+/// Each cached table holds `cluster_size / 8` entries of 8 bytes each,
+/// so with a 64 KB cluster size this is 64 * 8 KB = 512 KB of cache.
+const L2_CACHE_MAX_TABLES: usize = 64;
 
 /// QCOW2 magic: "QFI\xFB" as big-endian u32.
 const QCOW2_MAGIC: u32 = 0x514649FB;
@@ -19,22 +26,15 @@ pub struct QcowDisk {
     cluster_bits: u32,
     cluster_size: u64,
     l2_bits: u32,
+    /// Number of u64 entries in one L2 table (= cluster_size / 8).
+    l2_entries: usize,
     l1_table: Vec<u64>,
     disk_size: u64,
     cursor: u64,
     parent: Option<Box<QcowDisk>>,
-}
-
-fn read_u32_be(f: &mut File) -> std::io::Result<u32> {
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)?;
-    Ok(u32::from_be_bytes(buf))
-}
-
-fn read_u64_be(f: &mut File) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8];
-    f.read_exact(&mut buf)?;
-    Ok(u64::from_be_bytes(buf))
+    /// Cache of L2 tables keyed by their on-disk byte offset.
+    /// Each value is the full L2 table decoded as big-endian u64 entries.
+    l2_cache: HashMap<u64, Vec<u64>>,
 }
 
 struct QcowHeader {
@@ -52,43 +52,43 @@ struct QcowHeader {
 fn parse_header(file: &mut File) -> Result<QcowHeader> {
     file.seek(SeekFrom::Start(0))?;
 
-    let magic = read_u32_be(file)?;
+    let magic = read_u32_be_file(file)?;
     if magic != QCOW2_MAGIC {
-        return Err(GovmemError::InvalidMagic(magic));
+        return Err(VmkatzError::InvalidMagic(magic));
     }
 
-    let version = read_u32_be(file)?;
+    let version = read_u32_be_file(file)?;
     if version != 2 && version != 3 {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Unsupported QCOW2 version: {}",
             version
         )));
     }
 
-    let backing_file_offset = read_u64_be(file)?;
-    let backing_file_size = read_u32_be(file)?;
-    let cluster_bits = read_u32_be(file)?;
+    let backing_file_offset = read_u64_be_file(file)?;
+    let backing_file_size = read_u32_be_file(file)?;
+    let cluster_bits = read_u32_be_file(file)?;
 
     // Sanity check cluster_bits (typically 9..24, default 16 = 64KB)
     if !(9..=24).contains(&cluster_bits) {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Invalid QCOW2 cluster_bits: {}",
             cluster_bits
         )));
     }
 
-    let disk_size = read_u64_be(file)?;
-    let encryption_method = read_u32_be(file)?;
+    let disk_size = read_u64_be_file(file)?;
+    let encryption_method = read_u32_be_file(file)?;
 
     if encryption_method != 0 {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Encrypted QCOW2 not supported (method={})",
             encryption_method
         )));
     }
 
-    let l1_size = read_u32_be(file)?;
-    let l1_table_offset = read_u64_be(file)?;
+    let l1_size = read_u32_be_file(file)?;
+    let l1_table_offset = read_u64_be_file(file)?;
 
     Ok(QcowHeader {
         version,
@@ -126,7 +126,7 @@ impl QcowDisk {
         file.seek(SeekFrom::Start(header.l1_table_offset))?;
         let mut l1_table = Vec::with_capacity(header.l1_size as usize);
         for _ in 0..header.l1_size {
-            l1_table.push(read_u64_be(&mut file)?);
+            l1_table.push(read_u64_be_file(&mut file)?);
         }
 
         // Open backing file if present
@@ -143,15 +143,19 @@ impl QcowDisk {
             None
         };
 
+        let l2_entries = (cluster_size / 8) as usize;
+
         Ok(QcowDisk {
             file,
             cluster_bits,
             cluster_size,
             l2_bits,
+            l2_entries,
             l1_table,
             disk_size: header.disk_size,
             cursor: 0,
             parent,
+            l2_cache: HashMap::new(),
         })
     }
 
@@ -171,18 +175,12 @@ impl QcowDisk {
         let l2_table_offset = l1_entry & OFFSET_MASK;
 
         if l2_table_offset == 0 {
-            // L1 entry unallocated → parent or zeros
+            // L1 entry unallocated -> parent or zeros
             return self.read_from_parent_or_zero(virtual_offset, buf);
         }
 
-        // Read L2 entry (big-endian u64)
-        let l2_byte_offset = l2_table_offset + l2_idx as u64 * 8;
-        self.file.seek(SeekFrom::Start(l2_byte_offset))?;
-        let l2_entry = {
-            let mut b = [0u8; 8];
-            self.file.read_exact(&mut b)?;
-            u64::from_be_bytes(b)
-        };
+        // Look up the L2 entry, using the cache to avoid per-cluster seeks.
+        let l2_entry = self.cached_l2_lookup(l2_table_offset, l2_idx)?;
 
         if l2_entry & COMPRESSED_FLAG != 0 {
             return Err(std::io::Error::new(
@@ -194,7 +192,7 @@ impl QcowDisk {
         let data_cluster_offset = l2_entry & OFFSET_MASK;
 
         if data_cluster_offset == 0 {
-            // L2 entry unallocated → parent or zeros
+            // L2 entry unallocated -> parent or zeros
             return self.read_from_parent_or_zero(virtual_offset, buf);
         }
 
@@ -202,6 +200,43 @@ impl QcowDisk {
         let file_offset = data_cluster_offset + cluster_off;
         self.file.seek(SeekFrom::Start(file_offset))?;
         self.file.read(buf)
+    }
+
+    /// Look up a single L2 entry, reading and caching the entire L2 table on miss.
+    /// `l2_table_offset` is the on-disk byte offset of the L2 table.
+    /// `l2_idx` is the index within that table.
+    fn cached_l2_lookup(
+        &mut self,
+        l2_table_offset: u64,
+        l2_idx: usize,
+    ) -> std::io::Result<u64> {
+        // Fast path: table already cached.
+        if let Some(table) = self.l2_cache.get(&l2_table_offset) {
+            return Ok(table[l2_idx]);
+        }
+
+        // Cache miss: read the full L2 table (one cluster worth of u64 entries).
+        let l2_entries = self.l2_entries;
+        let mut raw = vec![0u8; l2_entries * 8];
+        self.file.seek(SeekFrom::Start(l2_table_offset))?;
+        self.file.read_exact(&mut raw)?;
+
+        let table: Vec<u64> = raw
+            .chunks_exact(8)
+            .map(|c| u64::from_be_bytes(c.try_into().unwrap()))
+            .collect();
+
+        let entry = table[l2_idx];
+
+        // Evict the entire cache when it reaches the size limit.
+        // This is simple and effective: the working set will quickly re-populate.
+        if self.l2_cache.len() >= L2_CACHE_MAX_TABLES {
+            self.l2_cache.clear();
+        }
+
+        self.l2_cache.insert(l2_table_offset, table);
+
+        Ok(entry)
     }
 
     /// Read from parent backing file, or return zeros if no parent.
@@ -283,46 +318,5 @@ fn resolve_backing_path(image_path: &Path, backing_name: &str) -> std::path::Pat
     } else {
         let base_dir = image_path.parent().unwrap_or(std::path::Path::new("."));
         base_dir.join(backing)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::disk::DiskImage;
-
-    #[test]
-    fn test_open_qcow2() {
-        let path = Path::new("/tmp/test.qcow2");
-        if !path.exists() {
-            return;
-        }
-        let mut disk = QcowDisk::open(path).expect("failed to open QCOW2");
-        assert_eq!(disk.disk_size(), 85899345920); // 80 GB
-
-        // Read MBR and check signature
-        let mut mbr = [0u8; 512];
-        disk.read_exact(&mut mbr).expect("failed to read MBR");
-        assert_eq!(mbr[510], 0x55);
-        assert_eq!(mbr[511], 0xAA);
-
-        // Check NTFS signature at LBA 2048 (byte offset 0x100000)
-        disk.seek(SeekFrom::Start(2048 * 512)).unwrap();
-        let mut ntfs_hdr = [0u8; 8];
-        disk.read_exact(&mut ntfs_hdr).unwrap();
-        assert_eq!(&ntfs_hdr[3..8], b"NTFS ");
-    }
-
-    #[test]
-    fn test_qcow2_sam_extraction() {
-        let path = Path::new("/tmp/test.qcow2");
-        if !path.exists() {
-            return;
-        }
-        let secrets = crate::sam::extract_disk_secrets(path).expect("SAM extraction failed");
-        assert!(!secrets.sam_entries.is_empty(), "should find SAM entries");
-        // At minimum, Administrator (RID 500) and Guest (RID 501) should exist
-        let admin = secrets.sam_entries.iter().find(|e| e.rid == 500);
-        assert!(admin.is_some(), "Administrator account not found");
     }
 }

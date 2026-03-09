@@ -12,7 +12,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
 
 const PAGE_SIZE: u64 = 4096;
@@ -51,30 +51,28 @@ impl QemuElfLayer {
         let mmap = unsafe { Mmap::map(&file)? };
 
         if mmap.len() < ELF64_EHDR_SIZE {
-            return Err(GovmemError::InvalidMagic(0));
+            return Err(VmkatzError::InvalidMagic(0));
         }
 
         // Parse ELF64 header
         let data = &mmap[..];
         if data[0..4] != ELF_MAGIC {
-            return Err(GovmemError::InvalidMagic(u32::from_le_bytes([
+            return Err(VmkatzError::InvalidMagic(u32::from_le_bytes([
                 data[0], data[1], data[2], data[3],
             ])));
         }
         if data[4] != ELFCLASS64 {
-            return Err(GovmemError::PeError(
-                0,
+            return Err(VmkatzError::ElfError(
                 "Not ELF64 (only 64-bit supported)".into(),
             ));
         }
         if data[5] != ELFDATA2LSB {
-            return Err(GovmemError::PeError(0, "Not little-endian ELF".into()));
+            return Err(VmkatzError::ElfError("Not little-endian ELF".into()));
         }
 
         let e_type = u16::from_le_bytes([data[16], data[17]]);
         if e_type != ET_CORE {
-            return Err(GovmemError::PeError(
-                0,
+            return Err(VmkatzError::ElfError(
                 format!("ELF type {} is not ET_CORE (expected {})", e_type, ET_CORE),
             ));
         }
@@ -84,8 +82,7 @@ impl QemuElfLayer {
         let e_phnum = u16::from_le_bytes([data[56], data[57]]) as usize;
 
         if e_phentsize < ELF64_PHDR_SIZE {
-            return Err(GovmemError::PeError(
-                0,
+            return Err(VmkatzError::ElfError(
                 format!(
                     "ELF phdr size {} < expected {}",
                     e_phentsize, ELF64_PHDR_SIZE
@@ -130,8 +127,7 @@ impl QemuElfLayer {
         }
 
         if segments.is_empty() {
-            return Err(GovmemError::PeError(
-                0,
+            return Err(VmkatzError::ElfError(
                 "No PT_LOAD segments found in ELF".into(),
             ));
         }

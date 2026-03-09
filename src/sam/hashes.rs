@@ -10,7 +10,7 @@ use des::cipher::{BlockDecrypt, KeyInit};
 
 use super::hive::Hive;
 use super::SamEntry;
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
@@ -183,7 +183,12 @@ fn decrypt_sam_hash(
     }
 
     // SAM_HASH header: +0x00 u16 PekID, +0x02 u16 Revision
-    let revision = u16::from_le_bytes(hash_data[2..4].try_into().unwrap());
+    let revision = u16::from_le_bytes(
+        hash_data.get(2..4)
+            .ok_or_else(|| sam_err("SAM_HASH header too short"))?
+            .try_into()
+            .map_err(|_| sam_err("SAM_HASH revision slice"))?,
+    );
 
     let decrypted = match revision {
         0x02 => {
@@ -346,18 +351,16 @@ pub(crate) fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 pub(crate) fn decode_utf16le(data: &[u8]) -> String {
-    let u16s: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .take_while(|&c| c != 0)
-        .collect();
-    String::from_utf16_lossy(&u16s)
+    crate::utils::utf16le_decode(data)
 }
 
 fn u32_le(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+    data.get(offset..offset + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or(0)
 }
 
-fn sam_err(msg: &str) -> GovmemError {
-    GovmemError::DecryptionError(format!("SAM: {}", msg))
+fn sam_err(msg: &str) -> VmkatzError {
+    VmkatzError::DecryptionError(format!("SAM: {}", msg))
 }

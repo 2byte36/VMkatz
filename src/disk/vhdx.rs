@@ -2,7 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
+use super::{read_u32_le_file, read_u64_le_file};
 
 /// VHDX file identifier signature: "vhdxfile" (8 bytes at offset 0).
 const VHDX_FILE_SIGNATURE: u64 = 0x656C_6966_7864_6876; // "vhdxfile" LE
@@ -63,18 +64,6 @@ pub struct VhdxDisk {
     parent: Option<Box<VhdxDisk>>,
 }
 
-fn read_u32_le(f: &mut File) -> std::io::Result<u32> {
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u64_le(f: &mut File) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8];
-    f.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
-}
-
 fn read_guid(f: &mut File) -> std::io::Result<[u8; 16]> {
     let mut buf = [0u8; 16];
     f.read_exact(&mut buf)?;
@@ -113,9 +102,9 @@ struct VhdxMetadata {
 /// Parse the VHDX file identifier at offset 0.
 fn validate_file_identifier(file: &mut File) -> Result<()> {
     file.seek(SeekFrom::Start(0))?;
-    let sig = read_u64_le(file)?;
+    let sig = read_u64_le_file(file)?;
     if sig != VHDX_FILE_SIGNATURE {
-        return Err(GovmemError::InvalidMagic(sig as u32));
+        return Err(VmkatzError::InvalidMagic(sig as u32));
     }
     Ok(())
 }
@@ -126,13 +115,13 @@ fn parse_headers(file: &mut File) -> Result<VhdxHeader> {
 
     for &offset in &[0x10000u64, 0x20000u64] {
         file.seek(SeekFrom::Start(offset))?;
-        let sig = read_u32_le(file)?;
+        let sig = read_u32_le_file(file)?;
         if sig != VHDX_HEADER_SIGNATURE {
             continue;
         }
         // Skip checksum (4 bytes) — we don't verify CRC-32C for read-only
-        let _checksum = read_u32_le(file)?;
-        let sequence_number = read_u64_le(file)?;
+        let _checksum = read_u32_le_file(file)?;
+        let sequence_number = read_u64_le_file(file)?;
         // FileWriteGuid (16B) + DataWriteGuid (16B)
         let _file_write_guid = read_guid(file)?;
         let _data_write_guid = read_guid(file)?;
@@ -149,25 +138,25 @@ fn parse_headers(file: &mut File) -> Result<VhdxHeader> {
         }
     }
 
-    best.ok_or_else(|| GovmemError::ProcessNotFound("No valid VHDX header found".to_string()))
+    best.ok_or_else(|| VmkatzError::DiskFormatError("No valid VHDX header found".to_string()))
 }
 
 /// Parse region table at the given offset, extract BAT and metadata region info.
 fn parse_region_table(file: &mut File, offset: u64) -> Result<VhdxRegions> {
     file.seek(SeekFrom::Start(offset))?;
-    let sig = read_u32_le(file)?;
+    let sig = read_u32_le_file(file)?;
     if sig != VHDX_REGION_SIGNATURE {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Invalid region table signature at 0x{:x}: 0x{:08x}",
             offset, sig
         )));
     }
-    let _checksum = read_u32_le(file)?;
-    let entry_count = read_u32_le(file)?;
-    let _reserved = read_u32_le(file)?;
+    let _checksum = read_u32_le_file(file)?;
+    let entry_count = read_u32_le_file(file)?;
+    let _reserved = read_u32_le_file(file)?;
 
     if entry_count > 2047 {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Region table entry count too large: {}",
             entry_count
         )));
@@ -180,9 +169,9 @@ fn parse_region_table(file: &mut File, offset: u64) -> Result<VhdxRegions> {
 
     for _ in 0..entry_count {
         let guid = read_guid(file)?;
-        let file_offset = read_u64_le(file)?;
-        let length = read_u32_le(file)?;
-        let _required = read_u32_le(file)?;
+        let file_offset = read_u64_le_file(file)?;
+        let length = read_u32_le_file(file)?;
+        let _required = read_u32_le_file(file)?;
 
         if guid == BAT_REGION_GUID {
             bat_offset = file_offset;
@@ -194,7 +183,7 @@ fn parse_region_table(file: &mut File, offset: u64) -> Result<VhdxRegions> {
     }
 
     if bat_offset == 0 || metadata_offset == 0 {
-        return Err(GovmemError::ProcessNotFound(
+        return Err(VmkatzError::DiskFormatError(
             "VHDX region table missing BAT or metadata region".to_string(),
         ));
     }
@@ -210,9 +199,9 @@ fn parse_region_table(file: &mut File, offset: u64) -> Result<VhdxRegions> {
 /// Parse the metadata region to extract disk parameters.
 fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata> {
     file.seek(SeekFrom::Start(metadata_offset))?;
-    let sig = read_u64_le(file)?;
+    let sig = read_u64_le_file(file)?;
     if sig != VHDX_METADATA_SIGNATURE {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Invalid metadata signature: 0x{:016x}",
             sig
         )));
@@ -228,7 +217,7 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
     file.read_exact(&mut reserved)?;
 
     if entry_count > 2047 {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Metadata entry count too large: {}",
             entry_count
         )));
@@ -238,10 +227,10 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
     let mut entries: Vec<([u8; 16], u32, u32)> = Vec::new();
     for _ in 0..entry_count {
         let item_id = read_guid(file)?;
-        let item_offset = read_u32_le(file)?;
-        let item_length = read_u32_le(file)?;
-        let _flags = read_u32_le(file)?;
-        let _reserved2 = read_u32_le(file)?;
+        let item_offset = read_u32_le_file(file)?;
+        let item_length = read_u32_le_file(file)?;
+        let _flags = read_u32_le_file(file)?;
+        let _reserved2 = read_u32_le_file(file)?;
         entries.push((item_id, item_offset, item_length));
     }
 
@@ -255,24 +244,24 @@ fn parse_metadata(file: &mut File, metadata_offset: u64) -> Result<VhdxMetadata>
 
         if *guid == META_FILE_PARAMETERS && *item_length >= 8 {
             file.seek(SeekFrom::Start(abs_offset))?;
-            let bs = read_u32_le(file)?;
-            let flags = read_u32_le(file)?;
+            let bs = read_u32_le_file(file)?;
+            let flags = read_u32_le_file(file)?;
             block_size = Some(bs);
             has_parent = (flags & 2) != 0; // bit 1 = HasParent
         } else if *guid == META_VIRTUAL_DISK_SIZE && *item_length >= 8 {
             file.seek(SeekFrom::Start(abs_offset))?;
-            virtual_disk_size = Some(read_u64_le(file)?);
+            virtual_disk_size = Some(read_u64_le_file(file)?);
         } else if *guid == META_LOGICAL_SECTOR_SIZE && *item_length >= 4 {
             file.seek(SeekFrom::Start(abs_offset))?;
-            logical_sector_size = Some(read_u32_le(file)?);
+            logical_sector_size = Some(read_u32_le_file(file)?);
         }
     }
 
     let block_size = block_size.ok_or_else(|| {
-        GovmemError::ProcessNotFound("VHDX metadata missing File Parameters".to_string())
+        VmkatzError::DiskFormatError("VHDX metadata missing File Parameters".to_string())
     })?;
     let virtual_disk_size = virtual_disk_size.ok_or_else(|| {
-        GovmemError::ProcessNotFound("VHDX metadata missing Virtual Disk Size".to_string())
+        VmkatzError::DiskFormatError("VHDX metadata missing Virtual Disk Size".to_string())
     })?;
     let logical_sector_size = logical_sector_size.unwrap_or(512);
 
@@ -301,10 +290,10 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
 
     for _ in 0..entry_count {
         let item_id = read_guid(file)?;
-        let item_off = read_u32_le(file)?;
-        let item_len = read_u32_le(file)?;
-        let _flags = read_u32_le(file)?;
-        let _reserved2 = read_u32_le(file)?;
+        let item_off = read_u32_le_file(file)?;
+        let item_len = read_u32_le_file(file)?;
+        let _flags = read_u32_le_file(file)?;
+        let _reserved2 = read_u32_le_file(file)?;
 
         if item_id == META_PARENT_LOCATOR {
             parent_offset = item_off;
@@ -336,8 +325,8 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
 
     let mut kv_entries = Vec::new();
     for _ in 0..kv_count {
-        let key_offset = read_u32_le(file)?;
-        let value_offset = read_u32_le(file)?;
+        let key_offset = read_u32_le_file(file)?;
+        let value_offset = read_u32_le_file(file)?;
         let mut lens = [0u8; 2];
         file.read_exact(&mut lens)?;
         let key_length = u16::from_le_bytes(lens);
@@ -383,13 +372,7 @@ fn parse_parent_locator(file: &mut File, metadata_offset: u64) -> Result<Option<
 
 /// Convert UTF-16LE bytes to a String, stripping null terminator.
 fn utf16le_to_string(data: &[u8]) -> String {
-    let u16s: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    String::from_utf16_lossy(&u16s)
-        .trim_end_matches('\0')
-        .to_string()
+    crate::utils::utf16le_decode(data)
 }
 
 /// Resolve a parent path (possibly Windows-style) relative to the child VHDX.
@@ -452,6 +435,8 @@ impl VhdxDisk {
         let block_size = metadata.block_size as u64;
         let logical_sector_size = metadata.logical_sector_size as u64;
         // chunk_ratio = (2^23 * logical_sector_size) / block_size
+        // 8_388_608 = 2^23 (VHDX spec §3.5.1: number of payload blocks covered
+        // by one sector bitmap block, derived from sector bitmap granularity).
         let chunk_ratio = (8_388_608 * logical_sector_size) / block_size;
         let data_blocks_count = metadata.virtual_disk_size.div_ceil(block_size);
 
@@ -473,7 +458,7 @@ impl VhdxDisk {
         file.seek(SeekFrom::Start(regions.bat_offset))?;
         let mut bat = Vec::with_capacity(bat_entries_to_read as usize);
         for _ in 0..bat_entries_to_read {
-            bat.push(read_u64_le(&mut file)?);
+            bat.push(read_u64_le_file(&mut file)?);
         }
 
         log::debug!(
@@ -705,14 +690,3 @@ impl super::DiskImage for VhdxDisk {
     }
 }
 
-/// Quick check: does the file start with the VHDX signature?
-pub fn is_vhdx(path: &Path) -> bool {
-    let Ok(mut f) = File::open(path) else {
-        return false;
-    };
-    let mut sig = [0u8; 8];
-    if f.read_exact(&mut sig).is_err() {
-        return false;
-    }
-    u64::from_le_bytes(sig) == VHDX_FILE_SIGNATURE
-}

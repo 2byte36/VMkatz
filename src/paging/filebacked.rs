@@ -9,7 +9,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::disk;
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use crate::windows::peb::LoadedModule;
 
 /// IMAGE_SCN_MEM_WRITE — skip writable sections (in-memory content differs from disk).
@@ -65,10 +65,10 @@ impl FileBackedResolver {
         let mut part_reader = crate::sam::PartitionReader::new(disk, partition_offset);
 
         let ntfs = ntfs::Ntfs::new(&mut part_reader)
-            .map_err(|e| GovmemError::DecryptionError(format!("NTFS: {}", e)))?;
+            .map_err(|e| VmkatzError::DecryptionError(format!("NTFS: {}", e)))?;
         let root = ntfs
             .root_directory(&mut part_reader)
-            .map_err(|e| GovmemError::DecryptionError(format!("NTFS root: {}", e)))?;
+            .map_err(|e| VmkatzError::DecryptionError(format!("NTFS root: {}", e)))?;
 
         // Navigate to Windows\System32
         let windows = crate::sam::find_entry(&ntfs, &root, &mut part_reader, "Windows")?;
@@ -108,7 +108,7 @@ impl FileBackedResolver {
         if loaded_count > 0 {
             Ok(())
         } else {
-            Err(GovmemError::DecryptionError(
+            Err(VmkatzError::DecryptionError(
                 "No DLLs found on disk".to_string(),
             ))
         }
@@ -127,21 +127,21 @@ impl FileBackedResolver {
     /// Parse PE headers, return non-writable sections mapped to module_base.
     fn parse_pe_sections(pe_data: &[u8], module_base: u64) -> Result<Vec<BackedSection>> {
         if pe_data.len() < 0x40 {
-            return Err(GovmemError::DecryptionError("PE too small".to_string()));
+            return Err(VmkatzError::DecryptionError("PE too small".to_string()));
         }
 
         // DOS header
         if u16::from_le_bytes([pe_data[0], pe_data[1]]) != 0x5A4D {
-            return Err(GovmemError::DecryptionError("Not a PE (no MZ)".to_string()));
+            return Err(VmkatzError::DecryptionError("Not a PE (no MZ)".to_string()));
         }
         let e_lfanew = u32::from_le_bytes(pe_data[0x3C..0x40].try_into().unwrap()) as usize;
         if e_lfanew + 24 > pe_data.len() {
-            return Err(GovmemError::DecryptionError("Invalid e_lfanew".to_string()));
+            return Err(VmkatzError::DecryptionError("Invalid e_lfanew".to_string()));
         }
 
         // PE signature
         if u32::from_le_bytes(pe_data[e_lfanew..e_lfanew + 4].try_into().unwrap()) != 0x0000_4550 {
-            return Err(GovmemError::DecryptionError(
+            return Err(VmkatzError::DecryptionError(
                 "Invalid PE signature".to_string(),
             ));
         }

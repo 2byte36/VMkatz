@@ -1,18 +1,15 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum GovmemError {
+pub enum VmkatzError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("Invalid VMSN magic: 0x{0:08x}")]
+    #[error("Invalid magic: 0x{0:08x}")]
     InvalidMagic(u32),
 
     #[error("Group '{0}' not found in VMSN")]
-    GroupNotFound(String),
-
-    #[error("Tag '{0}' not found")]
-    TagNotFound(String),
+    GroupNotFound(&'static str),
 
     #[error("Physical address 0x{0:x} unmappable (outside all regions)")]
     UnmappablePhysical(u64),
@@ -38,8 +35,12 @@ pub enum GovmemError {
     #[error("Decryption error: {0}")]
     DecryptionError(String),
 
-    #[error("Unsupported Windows build: {0}")]
-    UnsupportedBuild(u32),
+    #[error("Disk format error: {0}")]
+    DiskFormatError(String),
+
+    #[error("ELF error: {0}")]
+    ElfError(String),
+
 }
 
-pub type Result<T> = std::result::Result<T, GovmemError>;
+pub type Result<T> = std::result::Result<T, VmkatzError>;

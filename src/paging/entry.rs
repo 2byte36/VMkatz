@@ -1,3 +1,14 @@
+/// Physical address mask: bits 51:12 (standard 4KB page table entry).
+pub const PAGE_PHYS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+/// Address mask for 1GB huge pages (bits 51:30).
+pub const LARGE_1GB_MASK: u64 = 0x000F_FFFF_C000_0000;
+/// Address mask for 2MB large pages (bits 51:21).
+pub const LARGE_2MB_MASK: u64 = 0x000F_FFFF_FFE0_0000;
+/// Offset within 1GB huge page (bits 29:0).
+pub const PAGE_OFFSET_1GB: u64 = 0x3FFF_FFFF;
+/// Offset within 2MB large page (bits 20:0).
+pub const PAGE_OFFSET_2MB: u64 = 0x1F_FFFF;
+
 /// Wrapper for a 64-bit page table entry.
 #[derive(Debug, Clone, Copy)]
 pub struct PageTableEntry(pub u64);
@@ -15,7 +26,7 @@ impl PageTableEntry {
 
     /// Extract the physical frame address (bits 12-51, mask lower 12 bits).
     pub fn frame_addr(&self) -> u64 {
-        self.0 & 0x000F_FFFF_FFFF_F000
+        self.0 & PAGE_PHYS_MASK
     }
 
     /// Windows transition PTE: bit 11 set (prototype) and bit 10 clear.

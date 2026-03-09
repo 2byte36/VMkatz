@@ -65,8 +65,8 @@ fn discover_lsass_files(all_files: &[PathBuf], out: &mut Vec<PathBuf>) {
     for file in all_files {
         let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        if ext.eq_ignore_ascii_case("vmsn") {
-            // Only include .vmsn if a matching .vmem exists in same directory
+        if ext.eq_ignore_ascii_case("vmsn") || ext.eq_ignore_ascii_case("vmss") {
+            // Only include .vmsn/.vmss if a matching .vmem exists in same directory
             let vmem = file.with_extension("vmem");
             if vmem.is_file() {
                 out.push(file.clone());
@@ -289,10 +289,79 @@ fn parse_snapshot_number(stem: &str) -> Option<u32> {
 /// Check if a VMDK file is a text descriptor (not a binary extent).
 /// Descriptor files start with `# Disk DescriptorFile`.
 fn is_text_descriptor(path: &Path) -> bool {
-    if let Ok(data) = fs::read(path) {
-        if data.len() >= 21 {
-            return data.starts_with(b"# Disk DescriptorFile");
-        }
+    use std::io::Read;
+    let mut buf = [0u8; 21];
+    let Ok(mut f) = fs::File::open(path) else { return false };
+    if f.read(&mut buf).unwrap_or(0) >= 21 {
+        return buf.starts_with(b"# Disk DescriptorFile");
     }
     false
+}
+
+/// VM file extensions that indicate a directory contains VM files.
+const VM_EXTENSIONS: &[&str] = &[
+    // Memory snapshots
+    "vmsn", "vmss", "vmem", "sav", "elf", "bin", "raw",
+    // Disk images
+    "vmdk", "vdi", "qcow2", "qcow", "vhdx", "vhd",
+    // VM configuration (proves this is a VM directory)
+    "vmx", "vbox",
+];
+
+/// Recursively discover directories that contain VM files.
+///
+/// Walks the directory tree under `root` and returns directories containing
+/// at least one VM-related file (snapshot, disk image, or config).
+/// Results are sorted by path for consistent ordering.
+pub fn discover_vm_directories(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut vm_dirs = Vec::new();
+    walk_for_vm_dirs(root, &mut vm_dirs, 0)?;
+    vm_dirs.sort();
+    vm_dirs.dedup();
+    Ok(vm_dirs)
+}
+
+fn walk_for_vm_dirs(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) -> Result<()> {
+    // Safety: don't recurse too deep (prevents symlink loops)
+    if depth > 20 {
+        return Ok(());
+    }
+
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(()), // skip unreadable directories
+    };
+
+    let mut has_vm_files = false;
+    let mut subdirs = Vec::new();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // Skip hidden directories and common non-VM directories
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with('.') && name_str != "Logs" {
+                subdirs.push(path);
+            }
+        } else if path.is_file() && !has_vm_files {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_ascii_lowercase();
+                if VM_EXTENSIONS.iter().any(|&vm_ext| vm_ext == ext_lower) {
+                    has_vm_files = true;
+                }
+            }
+        }
+    }
+
+    if has_vm_files {
+        out.push(dir.to_path_buf());
+    }
+
+    // Recurse into subdirectories (but don't recurse into VM directories' Snapshots/)
+    for subdir in subdirs {
+        walk_for_vm_dirs(&subdir, out, depth + 1)?;
+    }
+
+    Ok(())
 }

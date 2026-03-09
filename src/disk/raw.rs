@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 /// Raw flat disk image — no container format, just raw sectors.
 /// Handles flat VMDKs (`-flat.vmdk`), raw dumps (`.raw`, `.img`, `.dd`),
@@ -14,10 +14,10 @@ pub struct RawDisk {
 
 impl RawDisk {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut file = File::open(path).map_err(GovmemError::Io)?;
+        let mut file = File::open(path).map_err(VmkatzError::Io)?;
         // metadata().len() returns 0 for block devices, so seek to end instead
-        let size = file.seek(SeekFrom::End(0)).map_err(GovmemError::Io)?;
-        file.seek(SeekFrom::Start(0)).map_err(GovmemError::Io)?;
+        let size = file.seek(SeekFrom::End(0)).map_err(VmkatzError::Io)?;
+        file.seek(SeekFrom::Start(0)).map_err(VmkatzError::Io)?;
         log::info!(
             "Raw disk: {} ({} MB)",
             path.display(),

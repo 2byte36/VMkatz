@@ -7,7 +7,7 @@
 
 pub mod ese;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use ese::EseDb;
 use crate::sam::hashes::{rc4, md5_hash, aes128_cbc_decrypt};
 
@@ -32,7 +32,7 @@ pub struct AdHashEntry {
 /// Build NTDS context from raw NTDS.dit + SYSTEM hive bytes.
 pub fn build_context(ntds_data: &[u8], system_data: &[u8]) -> Result<NtdsContext> {
     if !is_ese_database(ntds_data) {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "NTDS.dit does not look like a valid ESE database".to_string(),
         ));
     }
@@ -67,7 +67,7 @@ pub fn extract_ad_hashes(
 
     // The main table is "datatable"
     let columns = db.columns("datatable").ok_or_else(|| {
-        GovmemError::DecryptionError("datatable not found in NTDS.dit".to_string())
+        VmkatzError::DecryptionError("datatable not found in NTDS.dit".to_string())
     })?;
 
     log::info!("datatable has {} columns", columns.len());
@@ -110,7 +110,7 @@ pub fn extract_ad_hashes(
 
         // Read userAccountControl to verify this is a user account
         let _uac = read_col("ATTj589832")
-            .and_then(|d| if d.len() >= 4 { Some(u32::from_le_bytes(d[..4].try_into().unwrap())) } else { None })
+            .and_then(|d| crate::utils::read_u32_le(&d, 0))
             .unwrap_or(0);
 
         // Read encrypted NT hash (unicodePwd) and LM hash (dBCSPwd)
@@ -193,7 +193,7 @@ pub fn extract_ad_hashes(
     })?;
 
     if entries.is_empty() {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "No AD hashes found in NTDS.dit datatable".to_string(),
         ));
     }
@@ -221,62 +221,87 @@ fn extract_pek(db: &EseDb<'_>, boot_key: &[u8; 16]) -> Result<Vec<u8>> {
     })?;
 
     let pek_encrypted = pek_data.ok_or_else(|| {
-        GovmemError::DecryptionError("PEK (ATTk590689) not found in datatable".to_string())
+        VmkatzError::DecryptionError("PEK (ATTk590689) not found in datatable".to_string())
     })?;
 
     decrypt_pek(&pek_encrypted, boot_key)
 }
 
+/// Derive the RC4 key for PEK decryption: MD5(bootkey + key_salt * 1000).
+/// Used by both PEK v1 and v2.
+fn derive_pek_rc4_key(boot_key: &[u8; 16], key_salt: &[u8]) -> [u8; 16] {
+    let mut md5_input = Vec::with_capacity(16 + key_salt.len() * 1000);
+    md5_input.extend_from_slice(boot_key);
+    for _ in 0..1000 {
+        md5_input.extend_from_slice(key_salt);
+    }
+    md5_hash(&md5_input)
+}
+
 /// Decrypt the PEK blob using the bootkey.
 ///
-/// PEK format v2 (RC4): header(8) + key_material(16) + encrypted(rest)
-///   MD5(bootkey + key_material * 1000) -> RC4 key -> decrypt
+/// PEK format v1 (RC4, Win2003): header(8) + key_salt(16) + encrypted(rest)
+///   Decrypted layout: header(4) + key(16)
 ///
-/// PEK format v3 (AES): header(8) + salt(16) + encrypted(rest)
-///   AES-256-CBC with bootkey-derived key
+/// PEK format v2 (RC4, Vista+): header(8) + key_salt(16) + encrypted(rest)
+///   Decrypted layout: header(4) + padding(32) + key(16)
+///
+/// PEK format v3 (AES, Win2016+): header(8) + salt(16) + encrypted(rest)
+///   AES-128-CBC with bootkey as key and salt as IV
 fn decrypt_pek(pek_blob: &[u8], boot_key: &[u8; 16]) -> Result<Vec<u8>> {
     if pek_blob.len() < 24 {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "PEK blob too short".to_string(),
         ));
     }
 
-    // Version at offset 8 (after 8-byte header)
-    let version = u32::from_le_bytes(pek_blob[0..4].try_into().unwrap());
+    // Version at offset 0 (first 4 bytes)
+    let version = crate::utils::read_u32_le(pek_blob, 0).unwrap_or(0);
     log::info!("PEK version: {}", version);
 
     match version {
-        0x02 | 0x01 => {
-            // PEK v2: RC4-based
+        0x01 => {
+            // PEK v1 (Win2003): RC4-based, smaller decrypted structure
             // Structure: version(4) + flags(4) + key_salt(16) + encrypted_pek(rest)
+            // Min size: 24 (header+salt) + 20 (header(4) + key(16))
+            if pek_blob.len() < 24 + 20 {
+                return Err(VmkatzError::DecryptionError(
+                    "PEK v1 blob too short".to_string(),
+                ));
+            }
+
+            let key_salt = &pek_blob[8..24];
+            let rc4_key = derive_pek_rc4_key(boot_key, key_salt);
+            let decrypted = rc4(&rc4_key, &pek_blob[24..]);
+
+            // v1 decrypted layout: header(4) + key(16)
+            if decrypted.len() < 20 {
+                return Err(VmkatzError::DecryptionError(
+                    "Decrypted PEK v1 too short".to_string(),
+                ));
+            }
+
+            // Skip 4-byte header, take 16-byte key
+            Ok(decrypted[4..20].to_vec())
+        }
+        0x02 => {
+            // PEK v2 (Vista+): RC4-based, larger decrypted structure
+            // Structure: version(4) + flags(4) + key_salt(16) + encrypted_pek(rest)
+            // Min size: 24 (header+salt) + 76 (header(4) + padding(32) + key(16) + extra(24))
             if pek_blob.len() < 24 + 76 {
-                return Err(GovmemError::DecryptionError(
+                return Err(VmkatzError::DecryptionError(
                     "PEK v2 blob too short".to_string(),
                 ));
             }
 
             let key_salt = &pek_blob[8..24];
-
-            // Derive RC4 key: MD5(bootkey + key_salt * 1000)
-            let mut md5_input = Vec::with_capacity(16 + 16 * 1000);
-            md5_input.extend_from_slice(boot_key);
-            for _ in 0..1000 {
-                md5_input.extend_from_slice(key_salt);
-            }
-            let rc4_key = md5_hash(&md5_input);
-
+            let rc4_key = derive_pek_rc4_key(boot_key, key_salt);
             let decrypted = rc4(&rc4_key, &pek_blob[24..]);
-            // Decrypted format: PEK_KEY_DATA structures
-            // First 36 bytes: header(4) + unknown(32)
-            // Then 16 bytes of actual PEK
-            // Actually: the decrypted blob starts with a header,
-            // then contains one or more PEK key entries.
-            // Each entry: version(4) + padding(32) + key(16)
-            // We want the key at offset 36
 
+            // v2 decrypted layout: header(4) + padding(32) + key(16)
             if decrypted.len() < 52 {
-                return Err(GovmemError::DecryptionError(
-                    "Decrypted PEK too short".to_string(),
+                return Err(VmkatzError::DecryptionError(
+                    "Decrypted PEK v2 too short".to_string(),
                 ));
             }
 
@@ -287,7 +312,7 @@ fn decrypt_pek(pek_blob: &[u8], boot_key: &[u8; 16]) -> Result<Vec<u8>> {
             // PEK v3: AES-256-CBC
             // Structure: version(4) + flags(4) + salt(16) + encrypted(rest)
             if pek_blob.len() < 24 + 32 {
-                return Err(GovmemError::DecryptionError(
+                return Err(VmkatzError::DecryptionError(
                     "PEK v3 blob too short".to_string(),
                 ));
             }
@@ -301,14 +326,14 @@ fn decrypt_pek(pek_blob: &[u8], boot_key: &[u8; 16]) -> Result<Vec<u8>> {
             let decrypted = aes128_cbc_decrypt(boot_key, salt, encrypted)?;
 
             if decrypted.len() < 52 {
-                return Err(GovmemError::DecryptionError(
+                return Err(VmkatzError::DecryptionError(
                     "Decrypted PEK v3 too short".to_string(),
                 ));
             }
 
             Ok(decrypted[36..52].to_vec())
         }
-        _ => Err(GovmemError::DecryptionError(format!(
+        _ => Err(VmkatzError::DecryptionError(format!(
             "Unknown PEK version: {}",
             version
         ))),
@@ -333,7 +358,7 @@ fn decrypt_ad_hash(hash_blob: &[u8], pek: &[u8], rid: u32) -> Result<[u8; 16]> {
         return Ok([0u8; 16]); // Too short, treat as empty
     }
 
-    let version = u32::from_le_bytes(hash_blob[0..4].try_into().unwrap());
+    let version = crate::utils::read_u32_le(hash_blob, 0).unwrap_or(0);
 
     let decrypted = match version {
         0x01 => {
@@ -395,7 +420,7 @@ fn decrypt_hash_history(blob: &[u8], pek: &[u8], rid: u32) -> Result<Vec<[u8; 16
         return Ok(Vec::new());
     }
 
-    let version = u32::from_le_bytes(blob[0..4].try_into().unwrap());
+    let version = crate::utils::read_u32_le(blob, 0).unwrap_or(0);
 
     let decrypted = match version {
         0x01 => {
@@ -462,9 +487,9 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
     let mut block2 = GenericArray::clone_from_slice(&encrypted[8..16]);
 
     let cipher1 = des::Des::new_from_slice(&des_key1)
-        .map_err(|e| GovmemError::DecryptionError(format!("DES key1: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("DES key1: {}", e)))?;
     let cipher2 = des::Des::new_from_slice(&des_key2)
-        .map_err(|e| GovmemError::DecryptionError(format!("DES key2: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("DES key2: {}", e)))?;
 
     cipher1.decrypt_block(&mut block1);
     cipher2.decrypt_block(&mut block2);
@@ -475,8 +500,13 @@ fn des_unwrap_hash(encrypted: &[u8], rid: u32) -> Result<[u8; 16]> {
     Ok(hash)
 }
 
-/// Expand 7-byte key source to 8-byte DES key with odd parity.
+/// Expand 7-byte key material to 8-byte DES key with odd parity.
+///
+/// DES uses 56-bit keys packed into 8 bytes (7 data bits + 1 parity bit each).
+/// This distributes the 56 source bits into 8 key bytes, shifting each byte so
+/// that bits 7..1 carry key material and bit 0 is set for odd parity.
 fn expand_des_key(src: &[u8; 7]) -> [u8; 8] {
+    // Spread 7 source bytes across 8 key bytes (7 data bits each)
     let mut key = [0u8; 8];
     key[0] = src[0] >> 1;
     key[1] = ((src[0] & 0x01) << 6) | (src[1] >> 2);
@@ -487,6 +517,7 @@ fn expand_des_key(src: &[u8; 7]) -> [u8; 8] {
     key[6] = ((src[5] & 0x3F) << 1) | (src[6] >> 7);
     key[7] = src[6] & 0x7F;
 
+    // Set odd parity on each byte (DES ignores bit 0, uses it for parity check)
     for b in &mut key {
         let mut val = *b << 1;
         let parity = (val.count_ones() + 1) & 1;
@@ -504,12 +535,7 @@ fn decode_ad_string(data: &[u8]) -> String {
     }
     // Try UTF-16LE first (most AD strings)
     if data.len() >= 2 && data.len().is_multiple_of(2) {
-        let u16s: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .take_while(|&c| c != 0)
-            .collect();
-        let s = String::from_utf16_lossy(&u16s);
+        let s = crate::utils::utf16le_decode(data);
         if !s.is_empty() && s.chars().all(|c| !c.is_control() || c == '\n' || c == '\r') {
             return s;
         }

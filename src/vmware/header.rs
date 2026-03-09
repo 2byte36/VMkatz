@@ -1,15 +1,14 @@
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
-pub const HEADER_SIZE: usize = 12;
-pub const GROUP_SIZE: usize = 80;
+const HEADER_SIZE: usize = 12;
+const GROUP_SIZE: usize = 80;
 pub const PAGE_SIZE: usize = 0x1000;
 
-pub const VALID_MAGICS: [u32; 4] = [0xbed2bed0, 0xbad1bad1, 0xbed2bed2, 0xbed3bed3];
+const VALID_MAGICS: [u32; 4] = [0xbed2bed0, 0xbad1bad1, 0xbed2bed2, 0xbed3bed3];
 
 #[derive(Debug)]
 pub struct VmsnHeader {
     pub magic: u32,
-    pub reserved: u32,
     pub group_count: u32,
 }
 
@@ -21,29 +20,28 @@ pub struct VmsnGroup {
 }
 
 impl VmsnHeader {
-    pub fn parse(data: &[u8]) -> Result<Self> {
+    fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < HEADER_SIZE {
-            return Err(GovmemError::Io(std::io::Error::new(
+            return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::UnexpectedEof,
                 "VMSN header too short",
             )));
         }
-        let magic = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let magic = crate::utils::read_u32_le(data, 0).unwrap_or(0);
         if !VALID_MAGICS.contains(&magic) {
-            return Err(GovmemError::InvalidMagic(magic));
+            return Err(VmkatzError::InvalidMagic(magic));
         }
-        let reserved = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        let group_count = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        let _reserved = crate::utils::read_u32_le(data, 4).unwrap_or(0);
+        let group_count = crate::utils::read_u32_le(data, 8).unwrap_or(0);
         Ok(Self {
             magic,
-            reserved,
             group_count,
         })
     }
 }
 
 impl VmsnGroup {
-    pub fn parse(data: &[u8]) -> Self {
+    fn parse(data: &[u8]) -> Self {
         let name_bytes = &data[..64];
         let name = name_bytes
             .iter()
@@ -51,8 +49,8 @@ impl VmsnGroup {
             .copied()
             .collect::<Vec<u8>>();
         let name = String::from_utf8_lossy(&name).to_string();
-        let offset = u64::from_le_bytes(data[64..72].try_into().unwrap());
-        let size = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let offset = crate::utils::read_u64_le(data, 64).unwrap_or(0);
+        let size = crate::utils::read_u64_le(data, 72).unwrap_or(0);
         Self { name, offset, size }
     }
 }

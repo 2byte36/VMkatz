@@ -9,7 +9,31 @@
 
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
+
+/// Read a u32 from a byte slice at the given offset, returning 0 on out-of-bounds.
+fn read_u32(data: &[u8], off: usize) -> u32 {
+    data.get(off..off + 4)
+        .and_then(|s| s.try_into().ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or(0)
+}
+
+/// Read a u64 from a byte slice at the given offset, returning 0 on out-of-bounds.
+fn read_u64(data: &[u8], off: usize) -> u64 {
+    data.get(off..off + 8)
+        .and_then(|s| s.try_into().ok())
+        .map(u64::from_le_bytes)
+        .unwrap_or(0)
+}
+
+/// Read a u16 from a byte slice at the given offset, returning 0 on out-of-bounds.
+fn read_u16(data: &[u8], off: usize) -> u16 {
+    data.get(off..off + 2)
+        .and_then(|s| s.try_into().ok())
+        .map(u16::from_le_bytes)
+        .unwrap_or(0)
+}
 
 /// NTFS boot sector parameters.
 struct NtfsParams {
@@ -29,10 +53,10 @@ struct DataRun {
 /// Parse NTFS boot sector.
 fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
     if data.len() < 0x48 {
-        return Err(GovmemError::DecryptionError("Boot sector too small".into()));
+        return Err(VmkatzError::DecryptionError("Boot sector too small".into()));
     }
     if &data[3..7] != b"NTFS" {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "Not an NTFS boot sector".into(),
         ));
     }
@@ -41,8 +65,8 @@ fn parse_boot_sector(data: &[u8]) -> Result<NtfsParams> {
     let sectors_per_cluster = data[0x0D] as u64;
     let cluster_size = bytes_per_sector * sectors_per_cluster;
 
-    let mft_cluster = u64::from_le_bytes(data[0x30..0x38].try_into().unwrap());
-    let mftmirr_cluster = u64::from_le_bytes(data[0x38..0x40].try_into().unwrap());
+    let mft_cluster = read_u64(data, 0x30);
+    let mftmirr_cluster = read_u64(data, 0x38);
 
     // Record size: signed byte at 0x40. Positive → clusters, negative → 2^|value|.
     let raw = data[0x40] as i8;
@@ -161,11 +185,11 @@ fn find_attribute(record: &[u8], attr_type: u32) -> Option<(usize, usize)> {
     let mut pos = first_attr;
 
     while pos + 16 <= record.len() {
-        let atype = u32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
+        let atype = read_u32(record, pos);
         if atype == 0xFFFF_FFFF {
             break;
         }
-        let alen = u32::from_le_bytes(record[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let alen = read_u32(record, pos + 4) as usize;
         if alen < 16 || pos + alen > record.len() {
             break;
         }
@@ -187,11 +211,11 @@ fn find_all_attributes(record: &[u8], attr_type: u32) -> Vec<(usize, usize)> {
     let mut pos = first_attr;
 
     while pos + 16 <= record.len() {
-        let atype = u32::from_le_bytes(record[pos..pos + 4].try_into().unwrap());
+        let atype = read_u32(record, pos);
         if atype == 0xFFFF_FFFF {
             break;
         }
-        let alen = u32::from_le_bytes(record[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let alen = read_u32(record, pos + 4) as usize;
         if alen < 16 || pos + alen > record.len() {
             break;
         }
@@ -209,10 +233,8 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     if non_resident != 0 {
         return None; // $FILE_NAME is always resident
     }
-    let value_length =
-        u32::from_le_bytes(record[attr_pos + 0x10..attr_pos + 0x14].try_into().unwrap()) as usize;
-    let value_offset =
-        u16::from_le_bytes([record[attr_pos + 0x14], record[attr_pos + 0x15]]) as usize;
+    let value_length = read_u32(record, attr_pos + 0x10) as usize;
+    let value_offset = read_u16(record, attr_pos + 0x14) as usize;
     let data_start = attr_pos + value_offset;
 
     if data_start + value_length > record.len() || value_length < 0x44 {
@@ -221,7 +243,7 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     let fname = &record[data_start..data_start + value_length];
 
     // Parent directory MFT reference (6 bytes record number + 2 bytes seq)
-    let parent_ref = u64::from_le_bytes(fname[0..8].try_into().unwrap()) & 0x0000_FFFF_FFFF_FFFF;
+    let parent_ref = read_u64(fname, 0) & 0x0000_FFFF_FFFF_FFFF;
 
     let name_len = fname[0x40] as usize;
     let namespace = fname[0x41];
@@ -232,11 +254,7 @@ fn filename_from_attr(record: &[u8], attr_pos: usize) -> Option<(String, u64)> {
     if 0x42 + name_len * 2 > fname.len() {
         return None;
     }
-    let name_u16: Vec<u16> = fname[0x42..0x42 + name_len * 2]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
-        .collect();
-    Some((String::from_utf16_lossy(&name_u16), parent_ref))
+    Some((crate::utils::utf16le_decode(&fname[0x42..0x42 + name_len * 2]), parent_ref))
 }
 
 /// Extract best filename and parent ref from a FILE record (prefers Win32 over DOS).
@@ -261,8 +279,7 @@ fn extract_data_attribute(record: &[u8]) -> Option<(Vec<DataRun>, u64)> {
 
     if non_resident == 0 {
         // Resident
-        let value_length =
-            u32::from_le_bytes(record[pos + 0x10..pos + 0x14].try_into().unwrap()) as u64;
+        let value_length = read_u32(record, pos + 0x10) as u64;
         return Some((Vec::new(), value_length));
     }
 
@@ -270,7 +287,7 @@ fn extract_data_attribute(record: &[u8]) -> Option<(Vec<DataRun>, u64)> {
     if pos + 0x38 > record.len() {
         return None;
     }
-    let real_size = u64::from_le_bytes(record[pos + 0x30..pos + 0x38].try_into().unwrap());
+    let real_size = read_u64(record, pos + 0x30);
     let runs_offset = u16::from_le_bytes([record[pos + 0x20], record[pos + 0x21]]) as usize;
 
     if pos + runs_offset >= pos + len {
@@ -286,9 +303,8 @@ fn read_resident_data(record: &[u8]) -> Option<Vec<u8>> {
     if record[pos + 8] != 0 {
         return None;
     }
-    let value_length =
-        u32::from_le_bytes(record[pos + 0x10..pos + 0x14].try_into().unwrap()) as usize;
-    let value_offset = u16::from_le_bytes([record[pos + 0x14], record[pos + 0x15]]) as usize;
+    let value_length = read_u32(record, pos + 0x10) as usize;
+    let value_offset = read_u16(record, pos + 0x14) as usize;
     let start = pos + value_offset;
     if start + value_length > record.len() {
         return None;
@@ -384,10 +400,10 @@ fn read_hive_from_record<R: Read + Seek>(
 
     // Non-resident
     let (runs, file_size) = extract_data_attribute(record)
-        .ok_or_else(|| GovmemError::DecryptionError(format!("{}: no $DATA attribute", name)))?;
+        .ok_or_else(|| VmkatzError::DecryptionError(format!("{}: no $DATA attribute", name)))?;
 
     if runs.is_empty() {
-        return Err(GovmemError::DecryptionError(format!(
+        return Err(VmkatzError::DecryptionError(format!(
             "{}: no data runs",
             name
         )));
@@ -464,7 +480,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     // Read $MFTMirr (contains copies of MFT records 0-3)
     let mftmirr_abs = partition_offset + params.mftmirr_position;
     reader.seek(SeekFrom::Start(mftmirr_abs)).map_err(|e| {
-        GovmemError::DecryptionError(format!(
+        VmkatzError::DecryptionError(format!(
             "Cannot seek to MFTMirr at 0x{:x}: {}",
             mftmirr_abs, e
         ))
@@ -472,19 +488,19 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     let mut mftmirr_data = vec![0u8; params.record_size as usize * 4];
     reader
         .read_exact(&mut mftmirr_data)
-        .map_err(|e| GovmemError::DecryptionError(format!("Cannot read MFTMirr: {}", e)))?;
+        .map_err(|e| VmkatzError::DecryptionError(format!("Cannot read MFTMirr: {}", e)))?;
 
     // Parse record 0 ($MFT) from MFTMirr
     let mut mft_record = mftmirr_data[..params.record_size as usize].to_vec();
     if !fixup_file_record(&mut mft_record) {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "MFTMirr: invalid $MFT record (fixup failed)".into(),
         ));
     }
 
     // Get $MFT data runs — tells us where all MFT data is on disk
     let (mft_runs, mft_size) = extract_data_attribute(&mft_record)
-        .ok_or_else(|| GovmemError::DecryptionError("MFTMirr: no $DATA in $MFT record".into()))?;
+        .ok_or_else(|| VmkatzError::DecryptionError("MFTMirr: no $DATA in $MFT record".into()))?;
 
     let total_records = mft_size / params.record_size as u64;
     log::info!(
@@ -526,7 +542,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     }
 
     if accessible_segments.is_empty() {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "MFTMirr: no accessible MFT segments found".into(),
         ));
     }
@@ -724,7 +740,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     let sam_data = match sam_record {
         Some(ref rec) => read_hive_from_record(reader, rec, "SAM", &params, partition_offset)?,
         None => {
-            return Err(GovmemError::DecryptionError(
+            return Err(VmkatzError::DecryptionError(
                 "MFTMirr: SAM hive not found in accessible MFT segments".into(),
             ))
         }
@@ -732,7 +748,7 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
     let system_data = match system_record {
         Some(ref rec) => read_hive_from_record(reader, rec, "SYSTEM", &params, partition_offset)?,
         None => {
-            return Err(GovmemError::DecryptionError(
+            return Err(VmkatzError::DecryptionError(
                 "MFTMirr: SYSTEM hive not found in accessible MFT segments".into(),
             ))
         }
@@ -743,12 +759,12 @@ pub fn try_mftmirr_fallback<R: Read + Seek>(
 
     // Validate hive data
     if sam_data.len() < 0x1000 || &sam_data[0..4] != b"regf" {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "MFTMirr: SAM data is not a valid registry hive".into(),
         ));
     }
     if system_data.len() < 0x1000 || &system_data[0..4] != b"regf" {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "MFTMirr: SYSTEM data is not a valid registry hive".into(),
         ));
     }

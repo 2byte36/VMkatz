@@ -746,6 +746,7 @@ dependencies = [
  "hex",
  "log",
  "md-5",
+ "memchr",
  "memmap2",
  "ntfs",
  "sha2",

@@ -47,7 +47,7 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
             if pos + 4 > data.len() {
                 break;
             }
-            indices.push(u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()));
+            indices.push(crate::utils::read_u32_le(data, pos).unwrap_or(0));
             pos += 4;
         }
 
@@ -56,7 +56,7 @@ pub fn parse_tags(data: &[u8], base_offset: u64) -> Result<Vec<Tag>> {
             if pos + 8 > data.len() {
                 break;
             }
-            let size = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            let size = crate::utils::read_u64_le(data, pos).unwrap_or(0);
             pos += 8;
             size
         } else {

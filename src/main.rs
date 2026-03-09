@@ -16,20 +16,8 @@ use clap::Parser;
 
 #[cfg(feature = "hyperv")]
 use vmkatz::hyperv::HypervLayer;
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
 use vmkatz::lsass;
 use vmkatz::lsass::finder::PagefileRef;
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
 use vmkatz::lsass::types::Credential;
 #[cfg(any(
     feature = "vmware",
@@ -80,9 +68,11 @@ use vmkatz::windows::process;
         vmkatz ntds.dit SYSTEM                      Extract AD hashes from raw files\n  \
         vmkatz lsass.dmp                            Parse LSASS minidump\n  \
         vmkatz /path/to/vm/directory/               Auto-discover and process all files\n  \
+        vmkatz -r /vmfs/volumes/datastore/           Recursively scan all VM directories\n  \
         vmkatz --list-processes snapshot.vmsn        List running processes only\n  \
         vmkatz --dump lsass snapshot.vmsn           Dump LSASS as minidump for pypykatz\n  \
         vmkatz --dump lsass -o out.dmp snap.vmsn    Dump with custom output filename\n  \
+        vmkatz --carve partial_dump.raw              Carve from partial/raw memory\n  \
         vmkatz -v snapshot.vmsn                     Verbose output with process list"
 )]
 struct Args {
@@ -115,19 +105,22 @@ struct Args {
     disk: Option<String>,
 
     /// Dump a process's virtual memory as minidump (.dmp) file
+    #[cfg(feature = "dump")]
     #[arg(long, value_name = "PROCESS_NAME")]
     dump: Option<String>,
 
     /// Output file for --dump (default: <process>.dmp)
+    #[cfg(feature = "dump")]
     #[arg(short, long, value_name = "FILE")]
     output: Option<String>,
 
     /// Windows build number for minidump header (default: 19045)
+    #[cfg(feature = "dump")]
     #[arg(long, default_value_t = 19045, value_name = "NUMBER")]
     build: u32,
 
     /// Output format
-    #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm", "hashcat"])]
+    #[arg(long, default_value = "text", value_name = "FORMAT", value_parser = ["text", "csv", "ntlm", "hashcat", "brief"])]
     format: String,
 
     /// Color output (auto=detect terminal, always, never)
@@ -145,6 +138,48 @@ struct Args {
     /// Verbose output (show memory regions, process list, etc.)
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+
+    /// Show all logon sessions including those without credentials
+    #[arg(short, long, default_value_t = false)]
+    all: bool,
+
+    /// Skip nested EPT scanning (faster for non-VBS VMs)
+    #[arg(long, default_value_t = false)]
+    no_ept: bool,
+
+    /// Recursively scan directory for VM snapshot and disk image files
+    #[arg(short, long, default_value_t = false)]
+    recurse: bool,
+
+    /// Filter file types in directory/recursive mode (all, snapshot, disk)
+    #[arg(long, default_value = "all", value_name = "TYPE", value_parser = ["all", "snapshot", "disk"])]
+    scan: String,
+
+    /// Filter output to specific providers (comma-separated: msv,wdigest,kerberos,tspkg,dpapi,ssp,livessp,credman,cloudap)
+    #[arg(long, value_delimiter = ',', value_name = "LIST")]
+    provider: Vec<String>,
+
+    /// Carve credentials from partial/truncated/raw memory files
+    #[cfg(feature = "carve")]
+    #[arg(long, default_value_t = false)]
+    carve: bool,
+}
+
+impl Args {
+    /// Whether carve mode is enabled (always false when feature is disabled).
+    #[allow(dead_code)]
+    fn carve(&self) -> bool {
+        #[cfg(feature = "carve")]
+        { self.carve }
+        #[cfg(not(feature = "carve"))]
+        { false }
+    }
+}
+
+/// Returns true if a provider should be shown given the --provider filter.
+/// Empty filter = show all providers.
+fn should_show(providers: &[String], name: &str) -> bool {
+    providers.is_empty() || providers.iter().any(|p| p.eq_ignore_ascii_case(name))
 }
 
 // ---------------------------------------------------------------------------
@@ -231,6 +266,21 @@ fn fmt_lm_pwdump(hash: &[u8; 16]) -> String {
     }
 }
 
+/// Format a password for display: if it contains non-printable/control characters
+/// (typical of machine account random passwords), show as hex instead of garbled Unicode.
+fn fmt_password(password: &str, c: &Colors) -> String {
+    let is_printable = password.chars().all(|ch| {
+        !ch.is_control() && (ch.is_ascii_graphic() || ch.is_ascii_whitespace() || ch.is_alphanumeric())
+    });
+    if is_printable {
+        format!("{}{}{}", c.red, password, c.reset)
+    } else {
+        // Convert back to UTF-16LE bytes for hex display (machine account password)
+        let bytes: Vec<u8> = password.encode_utf16().flat_map(|w| w.to_le_bytes()).collect();
+        format!("{}(hex) {}{}", c.dim, hex::encode(&bytes), c.reset)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // File type detection by magic bytes
 // ---------------------------------------------------------------------------
@@ -275,6 +325,11 @@ fn main() -> anyhow::Result<()> {
         }
         Err(e) => e.exit(),
     };
+    if args.input_paths.is_empty() {
+        Args::parse_from(["vmkatz", "--help"]);
+        unreachable!()
+    }
+
     let log_level = if args.verbose { "info" } else { "warn" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
         .format_timestamp(None)
@@ -284,6 +339,9 @@ fn main() -> anyhow::Result<()> {
 
     // Directory mode: auto-discover and process all VM files
     if args.input_paths.len() == 1 && input_path.is_dir() {
+        if args.recurse {
+            return run_recursive(input_path, &args);
+        }
         return run_directory(input_path, &args);
     }
 
@@ -373,12 +431,12 @@ fn main() -> anyhow::Result<()> {
     // LSASS credential extraction mode
     #[cfg(feature = "sam")]
     {
-        let disk_path_str = args.disk.clone();
+        let disk_path_str = args.disk.as_deref();
         let pagefile_reader =
-            disk_path_str.as_ref().and_then(
+            disk_path_str.and_then(
                 |d| match vmkatz::paging::pagefile::PagefileReader::open(Path::new(d)) {
                     Ok(pf) => {
-                        println!(
+                        eprintln!(
                             "[+] Pagefile: {:.1} MB",
                             pf.pagefile_size() as f64 / (1024.0 * 1024.0),
                         );
@@ -390,7 +448,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 },
             );
-        let disk_ref = disk_path_str.as_ref().map(|d| Path::new(d.as_str()));
+        let disk_ref = disk_path_str.map(Path::new);
         run_lsass(input_path, &args, pagefile_reader.as_ref(), disk_ref)
     }
     #[cfg(not(feature = "sam"))]
@@ -407,30 +465,62 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     }
 
     if args.verbose {
-        println!("[*] SAM hash extraction from: {}", input_path.display());
+        eprintln!("[*] SAM hash extraction from: {}", input_path.display());
     }
-
-    let secrets =
-        vmkatz::sam::extract_disk_secrets(input_path).context("Disk secrets extraction failed")?;
 
     let c = get_colors(args);
+    let mut found_anything = false;
 
-    match args.format.as_str() {
-        "ntlm" => print_sam_ntlm(&secrets.sam_entries),
-        "csv" => print_sam_csv(&secrets.sam_entries),
-        "hashcat" => print_sam_hashcat(&secrets.sam_entries),
-        _ => print_sam_text(&secrets.sam_entries, c),
-    }
+    // SAM/LSA extraction — non-fatal so DPAPI masterkey scan can still proceed
+    match vmkatz::sam::extract_disk_secrets(input_path) {
+        Ok(secrets) => {
+            found_anything = true;
 
-    if !secrets.lsa_secrets.is_empty() && args.format != "hashcat" {
-        print_lsa_secrets(&secrets.lsa_secrets, c);
-    }
+            match args.format.as_str() {
+                "ntlm" => print_sam_ntlm(&secrets.sam_entries),
+                "csv" => print_sam_csv(&secrets.sam_entries),
+                "hashcat" => print_sam_hashcat(&secrets.sam_entries),
+                "brief" => print_sam_brief(&secrets.sam_entries),
+                _ => print_sam_text(&secrets.sam_entries, c),
+            }
 
-    if !secrets.cached_credentials.is_empty() {
-        match args.format.as_str() {
-            "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
-            _ => print_cached_credentials(&secrets.cached_credentials, c),
+            if !secrets.lsa_secrets.is_empty() {
+                match args.format.as_str() {
+                    "csv" => print_lsa_csv(&secrets.lsa_secrets),
+                    "hashcat" => {} // LSA secrets not applicable for hashcat
+                    _ => print_lsa_secrets(&secrets.lsa_secrets, c),
+                }
+            }
+
+            // Export DPAPI backup key PVK files when found
+            export_dpapi_backup_keys(&secrets.lsa_secrets);
+
+            if !secrets.cached_credentials.is_empty() {
+                match args.format.as_str() {
+                    "csv" => print_dcc2_csv(&secrets.cached_credentials),
+                    "hashcat" => print_dcc2_hashcat(&secrets.cached_credentials),
+                    _ => print_cached_credentials(&secrets.cached_credentials, c),
+                }
+            }
         }
+        Err(e) => {
+            eprintln!("[!] SAM extraction failed: {}", e);
+        }
+    }
+
+    // Extract DPAPI master key hashes from user profiles (independent of SAM)
+    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    if !dpapi_hashes.is_empty() {
+        found_anything = true;
+        match args.format.as_str() {
+            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
+            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
+            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
+    }
+
+    if !found_anything {
+        anyhow::bail!("No SAM hashes or DPAPI master keys found on disk");
     }
 
     Ok(())
@@ -439,7 +529,7 @@ fn run_sam(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 #[cfg(feature = "ntds.dit")]
 fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
     if args.verbose {
-        println!("[*] NTDS extraction from: {}", input_path.display());
+        eprintln!("[*] NTDS extraction from: {}", input_path.display());
     }
 
     let artifacts = vmkatz::sam::extract_ntds_artifacts(input_path)
@@ -455,18 +545,29 @@ fn run_ntds(input_path: &Path, args: &Args) -> anyhow::Result<()> {
 
     let c = get_colors(args);
 
-    println!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
-    println!("  Partition offset : 0x{:x}", artifacts.partition_offset);
-    println!("  ntds.dit size    : {} bytes", ctx.ntds_size);
-    println!("  SYSTEM size      : {} bytes", artifacts.system_data.len());
-    println!("  Bootkey          : {}", hex::encode(ctx.boot_key));
-    println!("  Hashes extracted : {}", hashes.len());
+    eprintln!("\n{}[+] NTDS Artifacts:{}", c.green, c.reset);
+    eprintln!("  Partition offset : 0x{:x}", artifacts.partition_offset);
+    eprintln!("  ntds.dit size    : {} bytes", ctx.ntds_size);
+    eprintln!("  SYSTEM size      : {} bytes", artifacts.system_data.len());
+    eprintln!("  Bootkey          : {}", hex::encode(ctx.boot_key));
+    eprintln!("  Hashes extracted : {}", hashes.len());
 
     match args.format.as_str() {
         "csv" => print_ntds_csv(&hashes),
         "hashcat" => print_ntds_hashcat(&hashes),
         "ntlm" => print_ntds_ntlm(&hashes),
+        "brief" => print_ntds_brief(&hashes),
         _ => print_ntds_text(&hashes, c),
+    }
+
+    // Also extract DPAPI master key hashes from user profiles on the same disk
+    let dpapi_hashes = vmkatz::sam::extract_dpapi_masterkeys(input_path);
+    if !dpapi_hashes.is_empty() {
+        match args.format.as_str() {
+            "csv" => print_dpapi_masterkey_csv(&dpapi_hashes),
+            "hashcat" => print_dpapi_masterkey_hashcat(&dpapi_hashes),
+            _ => print_dpapi_masterkey_text(&dpapi_hashes, c),
+        }
     }
 
     Ok(())
@@ -500,16 +601,17 @@ fn run_raw_ntds(ntds_path: &Path, system_path: &Path, args: &Args) -> anyhow::Re
 
     let c = get_colors(args);
 
-    println!("\n{}[+] NTDS (raw files):{}", c.green, c.reset);
-    println!("  ntds.dit : {} ({} bytes)", ntds_path.display(), ctx.ntds_size);
-    println!("  SYSTEM   : {} ({} bytes)", system_path.display(), system_data.len());
-    println!("  Bootkey  : {}", hex::encode(ctx.boot_key));
-    println!("  Hashes   : {}", hashes.len());
+    eprintln!("\n{}[+] NTDS (raw files):{}", c.green, c.reset);
+    eprintln!("  ntds.dit : {} ({} bytes)", ntds_path.display(), ctx.ntds_size);
+    eprintln!("  SYSTEM   : {} ({} bytes)", system_path.display(), system_data.len());
+    eprintln!("  Bootkey  : {}", hex::encode(ctx.boot_key));
+    eprintln!("  Hashes   : {}", hashes.len());
 
     match args.format.as_str() {
         "csv" => print_ntds_csv(&hashes),
         "hashcat" => print_ntds_hashcat(&hashes),
         "ntlm" => print_ntds_ntlm(&hashes),
+        "brief" => print_ntds_brief(&hashes),
         _ => print_ntds_text(&hashes, c),
     }
 
@@ -551,8 +653,8 @@ fn run_raw_hives(
     )?;
 
     let c = get_colors(args);
-    println!("\n{}[+] Raw hives:{}", c.green, c.reset);
-    println!("  SYSTEM  : {} (bootkey: {})", hives[system_idx].0.display(), hex::encode(bootkey));
+    eprintln!("\n{}[+] Raw hives:{}", c.green, c.reset);
+    eprintln!("  SYSTEM  : {} (bootkey: {})", hives[system_idx].0.display(), hex::encode(bootkey));
 
     let mut sam_entries = Vec::new();
     let mut lsa_secrets = Vec::new();
@@ -567,7 +669,7 @@ fn run_raw_hives(
         // Try as SAM
         if let Ok(entries) = vmkatz::sam::hashes::extract_hashes(data, &bootkey) {
             if !entries.is_empty() {
-                println!("  SAM     : {} ({} accounts)", path.display(), entries.len());
+                eprintln!("  SAM     : {} ({} accounts)", path.display(), entries.len());
                 sam_entries = entries;
                 continue;
             }
@@ -576,18 +678,11 @@ fn run_raw_hives(
         // Try as SECURITY (LSA secrets + cached creds)
         if let Ok(secrets) = vmkatz::sam::lsa::extract_lsa_secrets(data, &bootkey) {
             if !secrets.is_empty() {
-                println!("  SECURITY: {} ({} secrets)", path.display(), secrets.len());
-                let nlkm_key = secrets.iter().find_map(|s| {
-                    if s.name == "NL$KM" {
-                        Some(s.raw_data.clone())
-                    } else {
-                        None
-                    }
-                });
+                eprintln!("  SECURITY: {} ({} secrets)", path.display(), secrets.len());
                 lsa_secrets = secrets;
 
-                if let Some(ref nlkm) = nlkm_key {
-                    if let Ok(creds) = vmkatz::sam::cache::extract_cached_credentials(data, nlkm) {
+                if let Some(nlkm) = lsa_secrets.iter().find(|s| s.name == "NL$KM") {
+                    if let Ok(creds) = vmkatz::sam::cache::extract_cached_credentials(data, &nlkm.raw_data) {
                         cached_creds = creds;
                     }
                 }
@@ -604,16 +699,22 @@ fn run_raw_hives(
             "ntlm" => print_sam_ntlm(&sam_entries),
             "csv" => print_sam_csv(&sam_entries),
             "hashcat" => print_sam_hashcat(&sam_entries),
+            "brief" => print_sam_brief(&sam_entries),
             _ => print_sam_text(&sam_entries, c),
         }
     }
 
-    if !lsa_secrets.is_empty() && args.format != "hashcat" {
-        print_lsa_secrets(&lsa_secrets, c);
+    if !lsa_secrets.is_empty() {
+        match args.format.as_str() {
+            "csv" => print_lsa_csv(&lsa_secrets),
+            "hashcat" => {} // LSA secrets not applicable for hashcat
+            _ => print_lsa_secrets(&lsa_secrets, c),
+        }
     }
 
     if !cached_creds.is_empty() {
         match args.format.as_str() {
+            "csv" => print_dcc2_csv(&cached_creds),
             "hashcat" => print_dcc2_hashcat(&cached_creds),
             _ => print_cached_credentials(&cached_creds, c),
         }
@@ -623,12 +724,53 @@ fn run_raw_hives(
 }
 
 /// Handle LSASS minidump files.
-fn run_minidump(_input_path: &Path, _args: &Args) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "LSASS minidump parsing is not yet implemented.\n\
-         Workaround: use pypykatz to parse the minidump:\n  \
-         pypykatz minidump lsass.dmp"
-    );
+fn run_minidump(input_path: &Path, args: &Args) -> anyhow::Result<()> {
+    if args.verbose {
+        eprintln!("[*] Parsing LSASS minidump: {}", input_path.display());
+    }
+
+    let mdmp = vmkatz::minidump::Minidump::open(input_path)
+        .context("Failed to parse minidump")?;
+
+    if args.verbose {
+        eprintln!(
+            "[+] Minidump: {} memory regions, {} modules, Windows {}.{} build {} ({:?})",
+            mdmp.region_count(),
+            mdmp.modules.len(),
+            mdmp.major_version,
+            mdmp.minor_version,
+            mdmp.build_number,
+            mdmp.arch,
+        );
+        for m in &mdmp.modules {
+            eprintln!("    0x{:016x} ({:8} bytes) {}", m.base, m.size, m.base_name);
+        }
+    }
+
+    let region_ranges = mdmp.region_ranges();
+    let credentials = lsass::finder::extract_credentials_from_minidump(
+        &mdmp,
+        &mdmp.modules,
+        mdmp.build_number,
+        &region_ranges,
+        mdmp.arch,
+    )
+    .context("Credential extraction from minidump failed")?;
+
+    // Export Kerberos tickets if requested
+    export_kerberos_tickets(&credentials, args);
+
+    let c = get_colors(args);
+    match args.format.as_str() {
+        "csv" => print_csv(&credentials, &args.provider),
+        "ntlm" => print_ntlm(&credentials, &args.provider),
+        "hashcat" => print_hashcat(&credentials, &args.provider),
+        "brief" => print_brief(&credentials, &args.provider),
+        _ => print_text(&credentials, c, args.all, args.verbose, &args.provider),
+    }
+    report_extraction_summary(&credentials, &args.format);
+
+    Ok(())
 }
 
 #[cfg(feature = "ntds.dit")]
@@ -663,13 +805,13 @@ fn print_ntds_text(entries: &[vmkatz::ntds::AdHashEntry], c: &Colors) {
 #[cfg(feature = "ntds.dit")]
 fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry]) {
     for entry in entries {
-        let user = if entry.is_history {
+        let user: std::borrow::Cow<str> = if entry.is_history {
             match entry.history_index {
-                Some(idx) => format!("{}_history{}", entry.username, idx),
-                None => format!("{}_history", entry.username),
+                Some(idx) => format!("{}_history{}", entry.username, idx).into(),
+                None => format!("{}_history", entry.username).into(),
             }
         } else {
-            entry.username.clone()
+            (&*entry.username).into()
         };
 
         println!(
@@ -684,30 +826,38 @@ fn print_ntds_ntlm(entries: &[vmkatz::ntds::AdHashEntry]) {
 
 #[cfg(feature = "ntds.dit")]
 fn print_ntds_csv(entries: &[vmkatz::ntds::AdHashEntry]) {
-    println!("rid,username,is_history,history_index,nt_hash,lm_hash");
+    println!("provider,username,domain,secret_type,secret,target");
     for entry in entries {
-        let history_index = entry
-            .history_index
-            .map(|v| v.to_string())
-            .unwrap_or_default();
-        println!(
-            "{},{},{},{},{},{}",
-            entry.rid,
-            entry.username,
-            entry.is_history,
-            history_index,
-            hex::encode(entry.nt_hash),
-            fmt_lm_pwdump(&entry.lm_hash),
-        );
+        let provider = if entry.is_history {
+            let idx = entry.history_index.unwrap_or(0);
+            format!("ntds_history_{}", idx)
+        } else {
+            "ntds".to_string()
+        };
+        if entry.nt_hash != ZERO_HASH_16 {
+            println!("{},{},,nt_hash,{},{}", provider, csv_escape(&entry.username), hex::encode(entry.nt_hash), entry.rid);
+        }
+        if entry.lm_hash != ZERO_HASH_16 {
+            println!("{},{},,lm_hash,{},{}", provider, csv_escape(&entry.username), hex::encode(entry.lm_hash), entry.rid);
+        }
     }
 }
 
 #[cfg(feature = "ntds.dit")]
 fn print_ntds_hashcat(entries: &[vmkatz::ntds::AdHashEntry]) {
-    let zero_hash = [0u8; 16];
+    let mut seen = std::collections::HashSet::new();
     for entry in entries {
-        if entry.nt_hash != zero_hash {
-            println!("{}", hex::encode(entry.nt_hash));
+        if entry.nt_hash != ZERO_HASH_16 && seen.insert((&entry.username, entry.nt_hash)) {
+            println!("{}:{}", entry.username, hex::encode(entry.nt_hash));
+        }
+    }
+}
+
+#[cfg(feature = "ntds.dit")]
+fn print_ntds_brief(entries: &[vmkatz::ntds::AdHashEntry]) {
+    for entry in entries {
+        if entry.nt_hash != ZERO_HASH_16 && !entry.is_history {
+            println!("{}: {}", entry.username, hex::encode(entry.nt_hash));
         }
     }
 }
@@ -748,26 +898,96 @@ fn print_sam_ntlm(entries: &[vmkatz::sam::SamEntry]) {
 
 #[cfg(feature = "sam")]
 fn print_sam_csv(entries: &[vmkatz::sam::SamEntry]) {
-    println!("rid,username,nt_hash,lm_hash");
+    println!("provider,username,domain,secret_type,secret,target");
     for entry in entries {
-        println!(
-            "{},{},{},{}",
-            entry.rid,
-            entry.username,
-            hex::encode(entry.nt_hash),
-            fmt_lm_pwdump(&entry.lm_hash),
-        );
+        if entry.nt_hash != ZERO_HASH_16 {
+            println!("sam,{},,nt_hash,{},{}", csv_escape(&entry.username), hex::encode(entry.nt_hash), entry.rid);
+        }
+        if entry.lm_hash != ZERO_HASH_16 {
+            println!("sam,{},,lm_hash,{},{}", csv_escape(&entry.username), hex::encode(entry.lm_hash), entry.rid);
+        }
     }
 }
 
 #[cfg(feature = "sam")]
 fn print_sam_hashcat(entries: &[vmkatz::sam::SamEntry]) {
-    let zero_hash = [0u8; 16];
     for entry in entries {
-        if entry.nt_hash != zero_hash {
-            // hashcat mode 1000 (NTLM)
-            println!("{}", hex::encode(entry.nt_hash));
+        if entry.nt_hash != ZERO_HASH_16 {
+            // hashcat mode 1000 (NTLM) with --username format
+            println!("{}:{}", entry.username, hex::encode(entry.nt_hash));
         }
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_sam_brief(entries: &[vmkatz::sam::SamEntry]) {
+    for entry in entries {
+        if entry.nt_hash != ZERO_HASH_16 {
+            println!("{}: {}", entry.username, hex::encode(entry.nt_hash));
+        }
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_dcc2_csv(creds: &[vmkatz::sam::cache::CachedCredential]) {
+    println!("provider,username,domain,secret_type,secret,target");
+    for cred in creds {
+        println!(
+            "dcc2,{},{},dcc2_hash,$DCC2${}#{}#{},",
+            csv_escape(&cred.username),
+            csv_escape(if cred.dns_domain.is_empty() { &cred.domain } else { &cred.dns_domain }),
+            cred.iteration_count,
+            cred.username.to_lowercase(),
+            hex::encode(cred.dcc2_hash),
+        );
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_lsa_csv(secrets: &[vmkatz::sam::lsa::LsaSecret]) {
+    println!("provider,username,domain,secret_type,secret,target");
+    for secret in secrets {
+        match &secret.parsed {
+            vmkatz::sam::lsa::LsaSecretType::DpapiSystem { user_key, machine_key } => {
+                println!("lsa,,,dpapi_user_key,{},{}", hex::encode(user_key), csv_escape(&secret.name));
+                println!("lsa,,,dpapi_machine_key,{},{}", hex::encode(machine_key), csv_escape(&secret.name));
+            }
+            vmkatz::sam::lsa::LsaSecretType::MachineAccount { password_hex } => {
+                println!("lsa,,,machine_password,{},{}", csv_escape(password_hex), csv_escape(&secret.name));
+            }
+            vmkatz::sam::lsa::LsaSecretType::DefaultPassword { password } => {
+                println!("lsa,,,default_password,{},{}", csv_escape(password), csv_escape(&secret.name));
+            }
+            vmkatz::sam::lsa::LsaSecretType::ServicePassword { service, password } => {
+                println!("lsa,,,service_password,{},{}", csv_escape(password), csv_escape(service));
+            }
+            vmkatz::sam::lsa::LsaSecretType::CachedDomainKey { key } => {
+                println!("lsa,,,cached_domain_key,{},{}", hex::encode(key), csv_escape(&secret.name));
+            }
+            vmkatz::sam::lsa::LsaSecretType::DpapiBackupPreferred { guid } => {
+                println!("lsa,,,dpapi_backup_preferred,{},{}", csv_escape(guid), csv_escape(&secret.name));
+            }
+            vmkatz::sam::lsa::LsaSecretType::DpapiBackupKey { guid, key_data, .. } => {
+                println!("lsa,,,dpapi_backup_key,{},{}", hex::encode(key_data), csv_escape(guid));
+            }
+            vmkatz::sam::lsa::LsaSecretType::Raw => {
+                println!("lsa,,,raw,{},{}", hex::encode(&secret.raw_data), csv_escape(&secret.name));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_dpapi_masterkey_csv(hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash]) {
+    println!("provider,username,domain,secret_type,secret,target");
+    for h in hashes {
+        println!(
+            "dpapi_disk,{},{},masterkey_hash,{},{}",
+            csv_escape(&h.username),
+            csv_escape(&h.sid),
+            csv_escape(&h.hash),
+            csv_escape(&h.guid),
+        );
     }
 }
 
@@ -800,18 +1020,114 @@ fn print_cached_credentials(creds: &[vmkatz::sam::cache::CachedCredential], c: &
     }
 }
 
-fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
-    let discovery = vmkatz::discover::discover_vm_files(dir).context("VM file discovery failed")?;
+#[cfg(feature = "sam")]
+fn export_dpapi_backup_keys(secrets: &[vmkatz::sam::lsa::LsaSecret]) {
+    for secret in secrets {
+        if let vmkatz::sam::lsa::LsaSecretType::DpapiBackupKey {
+            guid, pvk, ..
+        } = &secret.parsed
+        {
+            if pvk.is_empty() {
+                continue;
+            }
+            let filename = format!("ntds_capi_0_{}.pvk", guid);
+            match std::fs::write(&filename, pvk) {
+                Ok(_) => {
+                    eprintln!("[+] DPAPI backup key exported: {}", filename);
+                }
+                Err(e) => {
+                    log::warn!("Failed to write PVK file {}: {}", filename, e);
+                }
+            }
+        }
+    }
+}
 
+#[cfg(feature = "sam")]
+fn print_dpapi_masterkey_text(
+    hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash],
+    c: &Colors,
+) {
     println!(
-        "[*] Found {} LSASS snapshot(s), {} disk image(s) in: {}",
-        discovery.lsass_files.len(),
-        discovery.disk_files.len(),
-        dir.display()
+        "\n{}[+] DPAPI Master Key Files ({} found):{}",
+        c.green,
+        hashes.len(),
+        c.reset
     );
+    for h in hashes {
+        println!("  User: {} ({})", h.username, h.sid);
+        println!("    GUID    : {}", h.guid);
+        println!("    Hashcat : mode {} ({})", h.mode, if h.mode == 15300 { "3DES/SHA1" } else { "AES256/SHA512" });
+        println!("    Hash    : {}", h.hash);
+    }
+}
+
+#[cfg(feature = "sam")]
+fn print_dpapi_masterkey_hashcat(hashes: &[vmkatz::sam::dpapi_masterkey::DpapiMasterKeyHash]) {
+    for h in hashes {
+        println!("{}", h.hash);
+    }
+}
+
+/// Classify a snapshot file by its hypervisor type based on extension.
+fn snapshot_type_label(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "vmsn" | "vmem" => "VMware",
+        "sav" => "VirtualBox",
+        "elf" => "QEMU/KVM",
+        "bin" | "raw" => "Hyper-V",
+        _ => "unknown",
+    }
+}
+
+/// Classify a disk image file by its type based on extension.
+fn disk_type_label(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    match ext.to_ascii_lowercase().as_str() {
+        "vmdk" => "VMDK",
+        "vdi" => "VDI",
+        "qcow2" | "qcow" => "QCOW2",
+        "vhdx" => "VHDX",
+        "vhd" => "VHD",
+        _ => "disk",
+    }
+}
+
+fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
+    let mut discovery = vmkatz::discover::discover_vm_files(dir).context("VM file discovery failed")?;
+
+    // Apply --scan filter
+    match args.scan.as_str() {
+        "snapshot" => discovery.disk_files.clear(),
+        "disk" => discovery.lsass_files.clear(),
+        _ => {} // "all"
+    }
+
+    // Build typed file list for display
+    if !discovery.lsass_files.is_empty() {
+        for f in &discovery.lsass_files {
+            let name = f.file_name().unwrap_or_default().to_string_lossy();
+            eprintln!("[*] {} snapshot: {}", snapshot_type_label(f), name);
+        }
+    }
+    if !discovery.disk_files.is_empty() {
+        for f in &discovery.disk_files {
+            let name = f.file_name().unwrap_or_default().to_string_lossy();
+            eprintln!("[*] {} disk: {}", disk_type_label(f), name);
+        }
+    }
 
     if discovery.lsass_files.is_empty() && discovery.disk_files.is_empty() {
-        println!("[!] No processable VM files found in directory");
+        if args.verbose {
+            eprintln!("[!] No processable VM files found in {}", dir.display());
+        }
         return Ok(());
     }
 
@@ -828,7 +1144,7 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
             discovery.disk_files.first().and_then(|d| {
                 match vmkatz::paging::pagefile::PagefileReader::open(d) {
                     Ok(pf) => {
-                        println!(
+                        eprintln!(
                             "[+] Pagefile: {:.1} MB from {}",
                             pf.pagefile_size() as f64 / (1024.0 * 1024.0),
                             d.file_name().unwrap_or_default().to_string_lossy()
@@ -859,7 +1175,7 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
 
         for file in &discovery.lsass_files {
             let name = file.file_name().unwrap_or_default().to_string_lossy();
-            println!("\n[*] LSASS: {}", name);
+            eprintln!("\n[*] LSASS: {}", name);
             if let Err(e) = run_lsass(file, args, pagefile, disk_path) {
                 eprintln!("[!] {}: {}", name, e);
             }
@@ -869,7 +1185,7 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
     #[cfg(feature = "sam")]
     for file in &discovery.disk_files {
         let name = file.file_name().unwrap_or_default().to_string_lossy();
-        println!("\n[*] SAM: {}", name);
+        eprintln!("\n[*] SAM: {}", name);
         if let Err(e) = run_sam(file, args) {
             eprintln!("[!] {}: {:#}", name, e);
         }
@@ -880,6 +1196,48 @@ fn run_directory(dir: &Path, args: &Args) -> anyhow::Result<()> {
         eprintln!("[!] {} disk image(s) found but SAM support not compiled in (rebuild with --features sam)", discovery.disk_files.len());
     }
 
+    Ok(())
+}
+
+/// Recursively scan a directory tree for VM files and process each VM directory.
+fn run_recursive(root: &Path, args: &Args) -> anyhow::Result<()> {
+    let vm_dirs = vmkatz::discover::discover_vm_directories(root)
+        .context("Recursive VM discovery failed")?;
+
+    if vm_dirs.is_empty() {
+        eprintln!("[!] No VM directories found under {}", root.display());
+        return Ok(());
+    }
+
+    eprintln!(
+        "[*] Found {} VM director{} under {}",
+        vm_dirs.len(),
+        if vm_dirs.len() == 1 { "y" } else { "ies" },
+        root.display()
+    );
+
+    let mut success = 0;
+    let mut errors = 0;
+
+    for dir in &vm_dirs {
+        eprintln!(
+            "\n{}",
+            "=".repeat(72)
+        );
+        eprintln!("[*] Processing: {}", dir.display());
+        match run_directory(dir, args) {
+            Ok(()) => success += 1,
+            Err(e) => {
+                eprintln!("[!] {}: {:#}", dir.display(), e);
+                errors += 1;
+            }
+        }
+    }
+
+    eprintln!(
+        "\n[*] Recursive scan complete: {} processed, {} errors",
+        success, errors
+    );
     Ok(())
 }
 
@@ -914,7 +1272,7 @@ fn run_lsass(
         .unwrap_or("");
 
     // Detect format by extension and magic bytes
-    let format = detect_lsass_format(input_path, ext);
+    let format = detect_lsass_format(input_path, ext, args.carve());
 
     match format {
         LsassFormat::VBox => {
@@ -923,7 +1281,7 @@ fn run_lsass(
                 run_with_layer(
                     || {
                         if verbose {
-                            println!(
+                            eprintln!(
                                 "[*] Opening VirtualBox saved state: {}",
                                 input_path.display()
                             );
@@ -931,7 +1289,7 @@ fn run_lsass(
                         let layer = VBoxLayer::open(input_path)
                             .context("Failed to open VirtualBox .sav file")?;
                         if verbose {
-                            println!(
+                            eprintln!(
                                 "[+] RAM: {} MB ({} pages mapped)",
                                 layer.phys_size() / (1024 * 1024),
                                 layer.page_count()
@@ -957,12 +1315,12 @@ fn run_lsass(
                 run_with_layer(
                     || {
                         if verbose {
-                            println!("[*] Opening QEMU ELF core dump: {}", input_path.display());
+                            eprintln!("[*] Opening QEMU ELF core dump: {}", input_path.display());
                         }
                         let layer = QemuElfLayer::open(input_path)
                             .context("Failed to open QEMU ELF core dump")?;
                         if verbose {
-                            println!(
+                            eprintln!(
                                 "[+] ELF: {} MB physical, {} PT_LOAD segments",
                                 layer.phys_size() / (1024 * 1024),
                                 layer.segment_count()
@@ -988,12 +1346,12 @@ fn run_lsass(
                 run_with_layer(
                     || {
                         if verbose {
-                            println!("[*] Opening Hyper-V memory dump: {}", input_path.display());
+                            eprintln!("[*] Opening Hyper-V memory dump: {}", input_path.display());
                         }
                         let layer = HypervLayer::open(input_path)
                             .context("Failed to open Hyper-V .bin memory dump")?;
                         if verbose {
-                            println!(
+                            eprintln!(
                                 "[+] RAM: {} MB identity-mapped",
                                 layer.phys_size() / (1024 * 1024)
                             );
@@ -1018,15 +1376,15 @@ fn run_lsass(
                 run_with_layer(
                     || {
                         if verbose {
-                            println!("[*] Opening VMware memory dump: {}", input_path.display());
+                            eprintln!("[*] Opening VMware memory dump: {}", input_path.display());
                         }
                         let layer = VmwareLayer::open(input_path)
                             .context("Failed to open VMware memory dump")?;
                         if verbose {
-                            println!("[+] VMEM mapped: {} MB", layer.phys_size() / (1024 * 1024));
-                            println!("[+] Memory regions: {}", layer.regions.len());
+                            eprintln!("[+] VMEM mapped: {} MB", layer.phys_size() / (1024 * 1024));
+                            eprintln!("[+] Memory regions: {}", layer.regions.len());
                             for (i, region) in layer.regions.iter().enumerate() {
-                                println!(
+                                eprintln!(
                                     "    Region {}: guest=0x{:x} vmem=0x{:x} pages=0x{:x} ({}MB)",
                                     i,
                                     region.guest_page_num,
@@ -1051,6 +1409,14 @@ fn run_lsass(
                     "VMware .vmem/.vmsn support not enabled (compile with --features vmware)"
                 )
             }
+        }
+        LsassFormat::UnsupportedDisk => {
+            let _ = (pagefile, disk_path);
+            anyhow::bail!(
+                "{} is a disk image, not a memory snapshot. Use --sam for SAM hash extraction, \
+                 or provide a memory snapshot (.vmsn, .vmem, .sav, .elf, .bin)",
+                input_path.display()
+            )
         }
     }
     } // cfg(any hypervisor)
@@ -1085,6 +1451,7 @@ enum LsassFormat {
     QemuElf,
     HypervBin,
     Vmware,
+    UnsupportedDisk,
 }
 
 /// Detect the memory snapshot format from extension and magic bytes.
@@ -1094,7 +1461,7 @@ enum LsassFormat {
     feature = "qemu",
     feature = "hyperv"
 ))]
-fn detect_lsass_format(path: &Path, ext: &str) -> LsassFormat {
+fn detect_lsass_format(path: &Path, ext: &str, carve: bool) -> LsassFormat {
     // Extension-based detection first
     if ext.eq_ignore_ascii_case("sav") {
         return LsassFormat::VBox;
@@ -1122,7 +1489,31 @@ fn detect_lsass_format(path: &Path, ext: &str) -> LsassFormat {
         return LsassFormat::QemuElf;
     }
 
-    // Default: VMware (.vmem, .vmsn, or anything else)
+    // Known VMware extensions always use VMware format
+    if ext.eq_ignore_ascii_case("vmem")
+        || ext.eq_ignore_ascii_case("vmsn")
+        || ext.eq_ignore_ascii_case("vmss")
+    {
+        return LsassFormat::Vmware;
+    }
+
+    // Reject disk image extensions — these should never reach LSASS extraction
+    if ext.eq_ignore_ascii_case("vmdk")
+        || ext.eq_ignore_ascii_case("vdi")
+        || ext.eq_ignore_ascii_case("qcow2")
+        || ext.eq_ignore_ascii_case("qcow")
+        || ext.eq_ignore_ascii_case("vhdx")
+        || ext.eq_ignore_ascii_case("vhd")
+    {
+        return LsassFormat::UnsupportedDisk;
+    }
+
+    // In carve mode, truly unknown files default to identity-mapped raw (HypervBin)
+    if carve {
+        return LsassFormat::HypervBin;
+    }
+
+    // Default: VMware (anything else)
     LsassFormat::Vmware
 }
 
@@ -1142,6 +1533,40 @@ fn has_elf_magic(path: &Path) -> bool {
     f.read_exact(&mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F']
 }
 
+#[cfg(all(
+    feature = "carve",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
+))]
+fn run_carve<L: PhysicalMemory>(
+    layer: &L,
+    args: &Args,
+    pagefile: PagefileRef<'_>,
+    disk_path: lsass::finder::DiskPathRef<'_>,
+) -> anyhow::Result<()> {
+    let credentials = lsass::carve::carve_credentials(layer, pagefile, disk_path);
+
+    if credentials.is_empty() {
+        anyhow::bail!("Carve mode: no credentials found");
+    }
+
+    let c = get_colors(args);
+    match args.format.as_str() {
+        "csv" => print_csv(&credentials, &args.provider),
+        "ntlm" => print_ntlm(&credentials, &args.provider),
+        "hashcat" => print_hashcat(&credentials, &args.provider),
+        "brief" => print_brief(&credentials, &args.provider),
+        _ => print_text(&credentials, c, args.all, args.verbose, &args.provider),
+    }
+    report_extraction_summary(&credentials, &args.format);
+
+    Ok(())
+}
+
 #[cfg(any(
     feature = "vmware",
     feature = "vbox",
@@ -1157,29 +1582,55 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
 ) -> anyhow::Result<()> {
     let layer = make_layer()?;
 
-    // Find System process (auto-detect Windows version from EPROCESS layout)
+    // -- Phase 1: Direct L1 scan for System process --
+    let t_system = std::time::Instant::now();
     match process::find_system_process_auto(&layer) {
-        Ok((system, eprocess_offsets)) => run_with_system(
-            &layer,
-            &system,
-            &eprocess_offsets,
-            args,
-            verbose,
-            pagefile,
-            disk_path,
-        ),
+        Ok((system, eprocess_offsets)) => {
+            eprintln!("[*] System discovery: {:?}", t_system.elapsed());
+            run_with_system(
+                &layer,
+                &system,
+                &eprocess_offsets,
+                args,
+                verbose,
+                pagefile,
+                disk_path,
+            )
+        }
+        #[cfg(feature = "carve")]
+        Err(_) if args.no_ept && args.carve => {
+            eprintln!("[*] System process not found — falling back to carve mode");
+            run_carve(&layer, args, pagefile, disk_path)
+        }
+        Err(_) if args.no_ept => {
+            anyhow::bail!("System process not found in physical memory (EPT scan disabled with --no-ept)");
+        }
+        #[cfg(feature = "carve")]
+        Err(_) if args.carve && layer.is_truncated() => {
+            // Truncated file + carve mode: skip expensive EPT scanning.
+            // EPT is almost certainly wrong (the System process is just in the truncated
+            // part). Go straight to L1 carve.
+            eprintln!("[*] lsass.exe not found in process list — falling back to carve mode");
+            run_carve(&layer, args, pagefile, disk_path)
+        }
         Err(_) => {
-            // EPT fallback: try to find nested hypervisor page tables (VBS/Hyper-V)
+            eprintln!("[*] System discovery (L1, not found): {:?}", t_system.elapsed());
+            // -- Phase 2: EPT candidate scan (VBS/Hyper-V nested paging) --
             log::info!("System process not found in L1 physical memory, trying EPT scan...");
-            println!("[*] VBS detected: scanning for nested EPT...");
+            eprintln!("[*] System process not found in L1 memory — trying nested EPT (VBS/Hyper-V)...");
 
+            let t_ept = std::time::Instant::now();
             let candidates = vmkatz::paging::ept::find_ept_candidates(&layer)
-                .context("Failed to find System process (no EPT found — VBS not supported for this snapshot)")?;
+                .context("Failed to find System process in physical memory (no valid EPT found)")?;
+            eprintln!("[*] EPT candidate scan: {:?}", t_ept.elapsed());
 
-            // Try each EPT candidate (ranked by non-zero translated pages)
+            // Try each EPT candidate (ranked by non-zero translated pages).
+            // Limit to 5 attempts — if System isn't in the top candidates, it's likely
+            // not a Windows VM or VBS isn't active.
+            const MAX_EPT_ATTEMPTS: usize = 5;
             let mut last_err = None;
-            for (i, candidate) in candidates.iter().enumerate() {
-                println!(
+            for (i, candidate) in candidates.iter().take(MAX_EPT_ATTEMPTS).enumerate() {
+                eprintln!(
                     "[*] Trying EPT #{} at L1=0x{:x} ({}/{} non-zero pages, {} PML4E)",
                     i + 1,
                     candidate.pml4_addr,
@@ -1194,25 +1645,40 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                     candidate.l2_size,
                 );
 
+                // Skip EPTs that were aborted (too many mapped pages = hypervisor-level)
+                if ept_layer.is_aborted() {
+                    eprintln!(
+                        "[*] EPT #{}: skipped (>{} mapped pages — hypervisor-level EPT)",
+                        i + 1,
+                        ept_layer.mapped_page_count(),
+                    );
+                    continue;
+                }
+
                 let mapped = ept_layer.mapped_page_count();
-                println!(
+                // Skip EPTs too large for the page-by-page scan (>4M pages = ~16 GB)
+                if mapped > 4_000_000 {
+                    eprintln!(
+                        "[*] EPT #{}: skipped ({} mapped pages — too large to scan)",
+                        i + 1,
+                        mapped,
+                    );
+                    continue;
+                }
+                eprintln!(
                     "[*] EPT #{}: {} mapped pages ({} MB of L2 space)",
                     i + 1,
                     mapped,
                     mapped * 4 / 1024,
                 );
 
-                // Fast path: iterate only mapped pages for small EPTs.
-                // For huge EPTs (hypervisor-level), use generic scan with precomputed binary search.
-                let result = if mapped < 10_000_000 {
-                    process::find_system_process_ept(&ept_layer, &layer).map_err(|e| e.into())
-                } else {
-                    process::find_system_process_auto(&ept_layer).map_err(|e| e.into())
-                };
+                // Single-pass scan: iterates mapped pages once, tries all offsets at each match.
+                let result = process::find_system_process_ept(&ept_layer, &layer)
+                    .map_err(|e| -> anyhow::Error { e.into() });
 
                 match result {
                     Ok((system, eprocess_offsets)) => {
-                        println!(
+                        eprintln!(
                             "[+] System found via EPT #{} at L2=0x{:x}, DTB=0x{:x}",
                             i + 1,
                             system.eprocess_phys,
@@ -1235,8 +1701,46 @@ fn run_with_layer<L: PhysicalMemory, F: FnOnce() -> anyhow::Result<L>>(
                 }
             }
 
+            // -- Phase 3: Carve mode on EPT layers --
+            #[cfg(feature = "carve")]
+            if args.carve {
+                eprintln!("[*] EPT System scan failed — trying carve mode on EPT layers...");
+
+                // Try carve on each viable EPT layer (guest memory is behind EPT)
+                for (i, candidate) in candidates.iter().take(MAX_EPT_ATTEMPTS).enumerate() {
+                    let ept_layer = vmkatz::paging::ept::EptLayer::new(
+                        &layer,
+                        candidate.pml4_addr,
+                        candidate.l2_size,
+                    );
+                    if ept_layer.is_aborted() {
+                        continue;
+                    }
+                    let mapped = ept_layer.mapped_page_count();
+                    if !(100..=4_000_000).contains(&mapped) {
+                        continue;
+                    }
+                    eprintln!(
+                        "[*] Carve: trying EPT #{} ({} mapped pages, {} MB)",
+                        i + 1,
+                        mapped,
+                        mapped * 4 / 1024,
+                    );
+                    match run_carve(&ept_layer, args, pagefile, disk_path) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            log::info!("Carve EPT #{}: {}", i + 1, e);
+                        }
+                    }
+                }
+
+                // -- Phase 4: Carve L1 directly (non-VBS VMs) --
+                eprintln!("[*] Carve: falling back to L1 physical memory");
+                return run_carve(&layer, args, pagefile, disk_path);
+            }
+
             Err(last_err
-                .unwrap_or_else(|| vmkatz::error::GovmemError::SystemProcessNotFound.into()))
+                .unwrap_or_else(|| vmkatz::error::VmkatzError::SystemProcessNotFound.into()))
         }
     }
 }
@@ -1257,13 +1761,15 @@ fn run_with_system<L: PhysicalMemory>(
     disk_path: vmkatz::lsass::finder::DiskPathRef<'_>,
 ) -> anyhow::Result<()> {
     // Enumerate all processes
+    let t_enum = std::time::Instant::now();
     let processes = process::enumerate_processes(layer, system, eprocess_offsets)
         .context("Failed to enumerate processes")?;
+    eprintln!("[*] Process enumeration: {:?}", t_enum.elapsed());
 
     if verbose {
-        println!("[+] Found {} processes:", processes.len());
+        eprintln!("[+] Found {} processes:", processes.len());
         for p in &processes {
-            println!(
+            eprintln!(
                 "    PID={:>6}  DTB=0x{:012x}  PEB=0x{:016x}  {}",
                 p.pid, p.dtb, p.peb_vaddr, p.name
             );
@@ -1275,6 +1781,7 @@ fn run_with_system<L: PhysicalMemory>(
     }
 
     // Process dump mode
+    #[cfg(feature = "dump")]
     if let Some(ref dump_name) = args.dump {
         let target = find_process_by_name(&processes, dump_name)
             .ok_or_else(|| anyhow::anyhow!("Process '{}' not found in process list", dump_name))?;
@@ -1283,7 +1790,7 @@ fn run_with_system<L: PhysicalMemory>(
         let output = args.output.as_deref().unwrap_or(&default_output);
         let output_path = std::path::Path::new(output);
 
-        println!(
+        eprintln!(
             "[*] Dumping {} (PID={}, DTB=0x{:x})...",
             target.name, target.pid, target.dtb
         );
@@ -1291,7 +1798,7 @@ fn run_with_system<L: PhysicalMemory>(
         vmkatz::dump::dump_process(layer, target, args.build, output_path, pagefile, disk_path)?;
 
         let file_size = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
-        println!(
+        eprintln!(
             "[+] Dumped {} → {} ({:.1} MB)",
             target.name,
             output,
@@ -1303,27 +1810,52 @@ fn run_with_system<L: PhysicalMemory>(
     // Find LSASS
     let lsass_proc = processes
         .iter()
-        .find(|p| p.name.eq_ignore_ascii_case("lsass.exe"))
-        .ok_or_else(|| anyhow::anyhow!("lsass.exe not found in process list"))?;
+        .find(|p| p.name.eq_ignore_ascii_case("lsass.exe"));
+
+    #[cfg(feature = "carve")]
+    if lsass_proc.is_none() && args.carve {
+        eprintln!("[*] lsass.exe not found in process list — falling back to carve mode");
+        return run_carve(layer, args, pagefile, disk_path);
+    }
+    let lsass_proc =
+        lsass_proc.ok_or_else(|| anyhow::anyhow!("lsass.exe not found in process list"))?;
 
     if verbose {
-        println!(
+        eprintln!(
             "\n[+] LSASS: PID={}, DTB=0x{:x}, PEB=0x{:x}",
             lsass_proc.pid, lsass_proc.dtb, lsass_proc.peb_vaddr
         );
     }
 
-    // Extract credentials
-    let credentials =
-        lsass::finder::extract_all_credentials(layer, lsass_proc, system.dtb, pagefile, disk_path)
-            .context("Credential extraction failed")?;
+    // Extract credentials (bitness-aware: dispatches to Vista+ or pre-Vista path)
+    let t_creds = std::time::Instant::now();
+    let credentials = match lsass::finder::extract_all_credentials_auto(
+        layer,
+        lsass_proc,
+        system.dtb,
+        eprocess_offsets,
+        pagefile,
+        disk_path,
+    ) {
+        Ok(c) => c,
+        #[cfg(feature = "carve")]
+        Err(e) if args.carve => {
+            eprintln!(
+                "[*] Credential extraction failed ({}) — falling back to carve mode",
+                e
+            );
+            return run_carve(layer, args, pagefile, disk_path);
+        }
+        Err(e) => return Err(e).context("Credential extraction failed"),
+    };
+    eprintln!("[*] Credential extraction: {:?}", t_creds.elapsed());
 
     // Report pagefile resolution stats
     #[cfg(feature = "sam")]
     if let Some(pf) = pagefile {
         let resolved = pf.pages_resolved();
         if resolved > 0 {
-            println!("[+] Pagefile: {} pages resolved from disk", resolved);
+            eprintln!("[+] Pagefile: {} pages resolved from disk", resolved);
         }
     }
 
@@ -1332,36 +1864,45 @@ fn run_with_system<L: PhysicalMemory>(
 
     let c = get_colors(args);
     match args.format.as_str() {
-        "csv" => print_csv(&credentials),
-        "ntlm" => print_ntlm(&credentials),
-        "hashcat" => print_hashcat(&credentials),
-        _ => print_text(&credentials, c),
+        "csv" => print_csv(&credentials, &args.provider),
+        "ntlm" => print_ntlm(&credentials, &args.provider),
+        "hashcat" => print_hashcat(&credentials, &args.provider),
+        "brief" => print_brief(&credentials, &args.provider),
+        _ => print_text(&credentials, c, args.all, args.verbose, &args.provider),
     }
+    report_extraction_summary(&credentials, &args.format);
 
     Ok(())
 }
 
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
+#[cfg(all(
+    feature = "dump",
+    any(
+        feature = "vmware",
+        feature = "vbox",
+        feature = "qemu",
+        feature = "hyperv"
+    )
 ))]
 fn find_process_by_name<'a>(
     processes: &'a [vmkatz::windows::process::Process],
     name: &str,
 ) -> Option<&'a vmkatz::windows::process::Process> {
-    // Try exact match (case-insensitive)
-    processes
-        .iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
-        .or_else(|| {
-            // Try with .exe appended
-            let with_exe = format!("{}.exe", name);
-            processes
-                .iter()
-                .find(|p| p.name.eq_ignore_ascii_case(&with_exe))
-        })
+    // Single-pass: check both exact and .exe-appended match
+    let mut exe_match = None;
+    for p in processes {
+        if p.name.eq_ignore_ascii_case(name) {
+            return Some(p);
+        }
+        if exe_match.is_none()
+            && p.name.len() == name.len() + 4
+            && p.name[..name.len()].eq_ignore_ascii_case(name)
+            && p.name[name.len()..].eq_ignore_ascii_case(".exe")
+        {
+            exe_match = Some(p);
+        }
+    }
+    exe_match
 }
 
 // ---------------------------------------------------------------------------
@@ -1385,7 +1926,7 @@ fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
     }
 
     if all_tickets.is_empty() {
-        println!("[*] No Kerberos tickets to export");
+        eprintln!("[*] No Kerberos tickets to export");
         return;
     }
 
@@ -1419,14 +1960,14 @@ fn export_kerberos_tickets(credentials: &[Credential], args: &Args) {
                 Err(e) => eprintln!("[!] Failed to write {}: {}", path.display(), e),
             }
         }
-        println!("[+] Exported {} .kirbi ticket(s) to {}", count, dir);
+        eprintln!("[+] Exported {} .kirbi ticket(s) to {}", count, dir);
     }
 
     // --ccache: write all tickets into a single ccache file
     if let Some(ccache_path) = &args.ccache {
         let data = build_ccache(&all_tickets);
         match std::fs::write(ccache_path, &data) {
-            Ok(_) => println!(
+            Ok(_) => eprintln!(
                 "[+] Exported {} ticket(s) to {} ({} bytes)",
                 all_tickets.len(),
                 ccache_path,
@@ -1517,7 +2058,8 @@ fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::Ker
     out.extend_from_slice(&(ticket.session_key.len() as u32).to_be_bytes());
     out.extend_from_slice(&ticket.session_key);
 
-    // Times: authtime, starttime, endtime, renew_till (each u32, unix timestamp)
+    // Convert Windows FILETIME (100-ns ticks since 1601-01-01) to Unix timestamp
+    // 10_000_000 = ticks per second, 11_644_473_600 = seconds between 1601 and 1970 epochs
     let to_unix = |ft: u64| -> u32 {
         if ft == 0 {
             return 0;
@@ -1549,27 +2091,32 @@ fn write_ccache_credential(out: &mut Vec<u8>, ticket: &vmkatz::lsass::types::Ker
     out.extend_from_slice(&0u32.to_be_bytes());
 }
 
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
-fn print_text(credentials: &[Credential], c: &Colors) {
+fn print_text(credentials: &[Credential], c: &Colors, show_all: bool, verbose: bool, providers: &[String]) {
     use vmkatz::lsass::types::{filetime_to_string, logon_type_name};
 
     let with_creds = credentials.iter().filter(|cr| cr.has_credentials()).count();
+    let hidden = credentials.len() - with_creds;
     println!(
-        "\n{}[+]{} {} logon session(s), {} with credentials:\n",
+        "\n{}[+]{} {} logon session(s), {} with credentials{}:\n",
         c.green, c.reset, credentials.len(), with_creds,
+        if !show_all && hidden > 0 {
+            format!(" ({} empty sessions hidden, use -a to show)", hidden)
+        } else {
+            String::new()
+        },
     );
     for cred in credentials {
+        if !show_all && !cred.has_credentials() {
+            continue;
+        }
+
         // LUID header
+        use vmkatz::lsass::types::{LUID_SYSTEM, LUID_NETWORK_SERVICE, LUID_LOCAL_SERVICE, LUID_IUSR};
         let luid_label = match cred.luid {
-            0x3e7 => " (SYSTEM)",
-            0x3e4 => " (NETWORK SERVICE)",
-            0x3e5 => " (LOCAL SERVICE)",
-            0x3e3 => " (IUSER)",
+            LUID_SYSTEM => " (SYSTEM)",
+            LUID_NETWORK_SERVICE => " (NETWORK SERVICE)",
+            LUID_LOCAL_SERVICE => " (LOCAL SERVICE)",
+            LUID_IUSR => " (IUSER)",
             _ => "",
         };
         println!("  {}LUID: 0x{:x}{}{}", c.bold, cred.luid, luid_label, c.reset);
@@ -1580,8 +2127,12 @@ fn print_text(credentials: &[Credential], c: &Colors) {
                 logon_type_name(cred.logon_type)
             );
         }
-        println!("  {}Username: {}{}", c.bold, cred.username, c.reset);
-        println!("  Domain: {}", cred.domain);
+        if !cred.username.is_empty() {
+            println!("  {}Username: {}{}", c.bold, cred.username, c.reset);
+        }
+        if !cred.domain.is_empty() {
+            println!("  Domain: {}", cred.domain);
+        }
         if !cred.logon_server.is_empty() {
             println!("  LogonServer: {}", cred.logon_server);
         }
@@ -1597,179 +2148,318 @@ fn print_text(credentials: &[Credential], c: &Colors) {
             continue;
         }
         if let Some(msv) = &cred.msv {
-            println!("  {}[MSV1_0]{}", c.cyan, c.reset);
-            if msv.lm_hash != ZERO_HASH_16 {
-                println!("    LM Hash : {}", fmt_hash(&msv.lm_hash, c));
+            if should_show(providers, "msv") {
+                println!("  {}[MSV1_0]{}", c.cyan, c.reset);
+                if msv.lm_hash != ZERO_HASH_16 {
+                    println!("    LM Hash : {}", fmt_hash(&msv.lm_hash, c));
+                }
+                println!("    NT Hash : {}", fmt_hash(&msv.nt_hash, c));
+                println!("    SHA1    : {}", fmt_hash(&msv.sha1_hash, c));
+                // DPAPI protection key = SHA1(NT password) — same as SHA1 hash for local accounts.
+                // Shown separately for mimikatz compatibility and offline DPAPI decryption workflows.
+                println!("    DPAPI   : {}", fmt_hash(&msv.sha1_hash, c));
             }
-            println!("    NT Hash : {}", fmt_hash(&msv.nt_hash, c));
-            println!("    SHA1    : {}", fmt_hash(&msv.sha1_hash, c));
         }
         if let Some(wd) = &cred.wdigest {
-            if !wd.password.is_empty() {
+            if !wd.password.is_empty() && should_show(providers, "wdigest") {
                 println!("  {}[WDigest]{}", c.cyan, c.reset);
-                println!("    Password: {}{}{}", c.red, wd.password, c.reset);
+                println!("    Password: {}", fmt_password(&wd.password, c));
             }
         }
         if let Some(krb) = &cred.kerberos {
-            println!("  {}[Kerberos]{}", c.cyan, c.reset);
-            if !krb.password.is_empty() {
-                println!("    Password: {}{}{}", c.red, krb.password, c.reset);
-            }
-            for key in &krb.keys {
-                println!(
-                    "    {:11}: {}",
-                    key.etype_name(),
-                    hex::encode(&key.key)
-                );
-            }
-            for ticket in &krb.tickets {
-                println!(
-                    "    [{}] {}",
-                    ticket.ticket_type,
-                    ticket.service_name.join("/")
-                );
-                println!("      Domain : {}", ticket.domain_name);
-                println!("      Client : {}", ticket.client_name.join("/"));
-                println!(
-                    "      EncType: {} | KeyType: {}",
-                    ticket.ticket_enc_type, ticket.key_type
-                );
-                println!("      Flags  : 0x{:08x}", ticket.ticket_flags);
-                println!("      Start  : {}", filetime_to_string(ticket.start_time));
-                println!("      End    : {}", filetime_to_string(ticket.end_time));
-                println!(
-                    "      Kirbi  : {} bytes (base64: {})",
-                    ticket.kirbi.len(),
-                    vmkatz::lsass::base64_encode(&ticket.kirbi)
-                );
+            if should_show(providers, "kerberos") {
+                println!("  {}[Kerberos]{}", c.cyan, c.reset);
+                if !krb.password.is_empty() {
+                    println!("    Password: {}", fmt_password(&krb.password, c));
+                }
+                // Deduplicate keys by value — show each unique key once with primary etype
+                let mut seen_keys: Vec<(&[u8], &str)> = Vec::new();
+                for key in &krb.keys {
+                    if !seen_keys.iter().any(|(k, _)| *k == key.key.as_slice()) {
+                        seen_keys.push((&key.key, key.etype_name()));
+                    }
+                }
+                for (key_bytes, etype_name) in &seen_keys {
+                    println!(
+                        "    {:11}: {}",
+                        etype_name,
+                        hex::encode(key_bytes)
+                    );
+                }
+                for ticket in &krb.tickets {
+                    println!(
+                        "    [{}] {}",
+                        ticket.ticket_type,
+                        ticket.service_name.join("/")
+                    );
+                    println!("      Domain : {}", ticket.domain_name);
+                    println!("      Client : {}", ticket.client_name.join("/"));
+                    println!(
+                        "      EncType: {} | KeyType: {}",
+                        ticket.ticket_enc_type, ticket.key_type
+                    );
+                    println!("      Flags  : 0x{:08x}", ticket.ticket_flags);
+                    println!("      Start  : {}", filetime_to_string(ticket.start_time));
+                    println!("      End    : {}", filetime_to_string(ticket.end_time));
+                    if verbose {
+                        println!(
+                            "      Kirbi  : {} bytes (base64: {})",
+                            ticket.kirbi.len(),
+                            vmkatz::lsass::base64_encode(&ticket.kirbi)
+                        );
+                    } else {
+                        println!("      Kirbi  : {} bytes", ticket.kirbi.len());
+                    }
+                }
             }
         }
         if let Some(ts) = &cred.tspkg {
-            if !ts.password.is_empty() {
+            if !ts.password.is_empty() && should_show(providers, "tspkg") {
                 println!("  {}[TsPkg]{}", c.cyan, c.reset);
-                println!("    Password: {}{}{}", c.red, ts.password, c.reset);
+                println!("    Password: {}", fmt_password(&ts.password, c));
             }
         }
-        for dk in &cred.dpapi {
-            println!("  {}[DPAPI]{}", c.cyan, c.reset);
-            println!("    GUID          : {}", dk.guid);
-            println!("    MasterKey     : {}{}{}", c.yellow, hex::encode(&dk.key), c.reset);
-            println!("    SHA1 MasterKey: {}{}{}", c.yellow, hex::encode(dk.sha1_masterkey), c.reset);
+        if should_show(providers, "dpapi") {
+            for dk in &cred.dpapi {
+                println!("  {}[DPAPI]{}", c.cyan, c.reset);
+                println!("    GUID          : {}", dk.guid);
+                println!("    MasterKey     : {}{}{}", c.yellow, hex::encode(&dk.key), c.reset);
+                println!("    SHA1 MasterKey: {}{}{}", c.yellow, hex::encode(dk.sha1_masterkey), c.reset);
+            }
         }
-        if !cred.credman.is_empty() {
+        if !cred.credman.is_empty() && should_show(providers, "credman") {
             println!("  {}[CredMan]{}", c.cyan, c.reset);
             for cm in &cred.credman {
                 println!("    Target  : {}", cm.target);
                 println!("    Username: {}", cm.username);
                 println!("    Domain  : {}", cm.domain);
-                println!("    Password: {}{}{}", c.red, cm.password, c.reset);
+                println!("    Password: {}", fmt_password(&cm.password, c));
             }
         }
         if let Some(ssp) = &cred.ssp {
-            if !ssp.password.is_empty() {
+            if !ssp.password.is_empty() && should_show(providers, "ssp") {
                 println!("  {}[SSP]{}", c.cyan, c.reset);
                 println!("    Username: {}", ssp.username);
                 println!("    Domain  : {}", ssp.domain);
-                println!("    Password: {}{}{}", c.red, ssp.password, c.reset);
+                println!("    Password: {}", fmt_password(&ssp.password, c));
             }
         }
         if let Some(live) = &cred.livessp {
-            if !live.password.is_empty() {
+            if !live.password.is_empty() && should_show(providers, "livessp") {
                 println!("  {}[LiveSSP]{}", c.cyan, c.reset);
                 println!("    Username: {}", live.username);
                 println!("    Domain  : {}", live.domain);
-                println!("    Password: {}{}{}", c.red, live.password, c.reset);
+                println!("    Password: {}", fmt_password(&live.password, c));
             }
         }
         if let Some(cap) = &cred.cloudap {
-            println!("  {}[CloudAP]{}", c.cyan, c.reset);
-            println!("    Username : {}", cap.username);
-            println!("    Domain   : {}", cap.domain);
-            if !cap.dpapi_key.is_empty() {
-                println!("    DPAPI Key: {}{}{}", c.yellow, hex::encode(&cap.dpapi_key), c.reset);
-            }
-            if !cap.prt.is_empty() {
-                println!("    PRT      : {}", cap.prt);
+            if should_show(providers, "cloudap") {
+                println!("  {}[CloudAP]{}", c.cyan, c.reset);
+                println!("    Username : {}", cap.username);
+                println!("    Domain   : {}", cap.domain);
+                if !cap.dpapi_key.is_empty() {
+                    println!("    DPAPI Key: {}{}{}", c.yellow, hex::encode(&cap.dpapi_key), c.reset);
+                }
+                if !cap.prt.is_empty() {
+                    println!("    PRT      : {}", cap.prt);
+                }
             }
         }
         println!();
     }
 }
 
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
 fn csv_escape(s: &str) -> String {
-    if s.contains(',') || s.contains('"') || s.contains('\n') {
-        format!("\"{}\"", s.replace('"', "\"\""))
+    let sanitized: String = s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect();
+    if sanitized.contains(',') || sanitized.contains('"') || sanitized.contains('\n') {
+        format!("\"{}\"", sanitized.replace('"', "\"\""))
     } else {
-        s.to_string()
+        sanitized
     }
 }
 
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
-fn print_csv(credentials: &[Credential]) {
-    println!("luid,username,domain,nt_hash,lm_hash,sha1_hash,wdigest_password,kerberos_password,tspkg_password");
+fn print_csv(credentials: &[Credential], providers: &[String]) {
+    println!("provider,username,domain,secret_type,secret,target");
     for cred in credentials.iter().filter(|c| c.has_credentials()) {
-        let (nt, lm, sha1) = if let Some(msv) = &cred.msv {
-            (
-                hex::encode(msv.nt_hash),
-                fmt_lm_pwdump(&msv.lm_hash),
-                hex::encode(msv.sha1_hash),
-            )
-        } else {
-            (String::new(), String::new(), String::new())
-        };
-        let wdigest_pw = cred
-            .wdigest
-            .as_ref()
-            .map(|w| w.password.as_str())
-            .unwrap_or("");
-        let kerb_pw = cred
-            .kerberos
-            .as_ref()
-            .map(|k| k.password.as_str())
-            .unwrap_or("");
-        let tspkg_pw = cred
-            .tspkg
-            .as_ref()
-            .map(|t| t.password.as_str())
-            .unwrap_or("");
+        let user = csv_escape(&cred.username);
+        let dom = csv_escape(&cred.domain);
 
-        println!(
-            "0x{:x},{},{},{},{},{},{},{},{}",
-            cred.luid,
-            csv_escape(&cred.username),
-            csv_escape(&cred.domain),
-            nt,
-            lm,
-            sha1,
-            csv_escape(wdigest_pw),
-            csv_escape(kerb_pw),
-            csv_escape(tspkg_pw),
+        if should_show(providers, "msv") {
+            if let Some(msv) = &cred.msv {
+                if msv.nt_hash != ZERO_HASH_16 {
+                    println!("msv,{},{},nt_hash,{},", user, dom, hex::encode(msv.nt_hash));
+                }
+                if msv.lm_hash != ZERO_HASH_16 {
+                    println!("msv,{},{},lm_hash,{},", user, dom, hex::encode(msv.lm_hash));
+                }
+                if msv.sha1_hash != [0u8; 20] {
+                    println!("msv,{},{},sha1,{},", user, dom, hex::encode(msv.sha1_hash));
+                }
+            }
+        }
+
+        if should_show(providers, "wdigest") {
+            if let Some(wd) = &cred.wdigest {
+                if !wd.password.is_empty() {
+                    println!("wdigest,{},{},password,{},", user, dom, csv_escape(&wd.password));
+                }
+            }
+        }
+
+        if should_show(providers, "kerberos") {
+            if let Some(krb) = &cred.kerberos {
+                if !krb.password.is_empty() {
+                    println!("kerberos,{},{},password,{},", user, dom, csv_escape(&krb.password));
+                }
+                for key in &krb.keys {
+                    println!(
+                        "kerberos,{},{},{},{},",
+                        user, dom, key.etype_name(), hex::encode(&key.key)
+                    );
+                }
+                for ticket in &krb.tickets {
+                    let svc = ticket.service_name.join("/");
+                    println!(
+                        "kerberos,{},{},ticket_{},{},{}",
+                        user, dom,
+                        ticket.ticket_type.to_string().to_ascii_lowercase(),
+                        vmkatz::lsass::base64_encode(&ticket.kirbi),
+                        csv_escape(&svc),
+                    );
+                }
+            }
+        }
+
+        if should_show(providers, "tspkg") {
+            if let Some(ts) = &cred.tspkg {
+                if !ts.password.is_empty() {
+                    println!("tspkg,{},{},password,{},", user, dom, csv_escape(&ts.password));
+                }
+            }
+        }
+
+        if should_show(providers, "ssp") {
+            if let Some(ssp) = &cred.ssp {
+                if !ssp.password.is_empty() {
+                    println!(
+                        "ssp,{},{},password,{},",
+                        csv_escape(&ssp.username), csv_escape(&ssp.domain),
+                        csv_escape(&ssp.password)
+                    );
+                }
+            }
+        }
+
+        if should_show(providers, "livessp") {
+            if let Some(live) = &cred.livessp {
+                if !live.password.is_empty() {
+                    println!(
+                        "livessp,{},{},password,{},",
+                        csv_escape(&live.username), csv_escape(&live.domain),
+                        csv_escape(&live.password)
+                    );
+                }
+            }
+        }
+
+        if should_show(providers, "credman") {
+            for cm in &cred.credman {
+                if !cm.password.is_empty() {
+                    println!(
+                        "credman,{},{},password,{},{}",
+                        csv_escape(&cm.username), csv_escape(&cm.domain),
+                        csv_escape(&cm.password), csv_escape(&cm.target)
+                    );
+                }
+            }
+        }
+
+        if should_show(providers, "dpapi") {
+            for dk in &cred.dpapi {
+                println!(
+                    "dpapi,{},{},masterkey,{},{}",
+                    user, dom, hex::encode(&dk.key), csv_escape(&dk.guid)
+                );
+                println!(
+                    "dpapi,{},{},sha1_masterkey,{},{}",
+                    user, dom, hex::encode(dk.sha1_masterkey), csv_escape(&dk.guid)
+                );
+            }
+        }
+
+        if should_show(providers, "cloudap") {
+            if let Some(cap) = &cred.cloudap {
+                if !cap.dpapi_key.is_empty() {
+                    println!(
+                        "cloudap,{},{},dpapi_key,{},",
+                        csv_escape(&cap.username), csv_escape(&cap.domain),
+                        hex::encode(&cap.dpapi_key)
+                    );
+                }
+                if !cap.prt.is_empty() {
+                    println!(
+                        "cloudap,{},{},prt,{},",
+                        csv_escape(&cap.username), csv_escape(&cap.domain),
+                        csv_escape(&cap.prt)
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Report a summary of extraction results to stderr.
+///
+/// For `ntlm`/`hashcat` formats, reports when zero hashes were found (so users can
+/// distinguish success-with-no-hashes from tool failure). For `text`, provides counts.
+fn report_extraction_summary(credentials: &[Credential], format: &str) {
+    let with_hash = credentials
+        .iter()
+        .filter(|c| {
+            c.msv
+                .as_ref()
+                .is_some_and(|m| m.nt_hash != ZERO_HASH_16)
+        })
+        .count();
+    let with_pw = credentials
+        .iter()
+        .filter(|c| {
+            c.wdigest
+                .as_ref()
+                .is_some_and(|w| !w.password.is_empty())
+                || c.kerberos
+                    .as_ref()
+                    .is_some_and(|k| !k.password.is_empty())
+                || c.tspkg.as_ref().is_some_and(|t| !t.password.is_empty())
+        })
+        .count();
+
+    if matches!(format, "ntlm" | "hashcat") && with_hash == 0 {
+        eprintln!(
+            "[*] No NTLM hashes found ({} sessions examined)",
+            credentials.len()
+        );
+    } else if matches!(format, "text" | "brief") {
+        eprintln!(
+            "[*] {} sessions, {} NT hashes, {} plaintext passwords",
+            credentials.len(),
+            with_hash,
+            with_pw
         );
     }
 }
 
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
-fn print_ntlm(credentials: &[Credential]) {
-    let zero_hash = [0u8; 16];
+fn print_ntlm(credentials: &[Credential], providers: &[String]) {
+    let mut seen = std::collections::HashSet::new();
     for cred in credentials.iter().filter(|c| c.has_credentials()) {
+        if !should_show(providers, "msv") {
+            continue;
+        }
         if let Some(msv) = &cred.msv {
-            if msv.nt_hash != zero_hash {
+            let key = (cred.username.clone(), cred.domain.clone(), msv.nt_hash);
+            if msv.nt_hash != ZERO_HASH_16 && seen.insert(key) {
                 println!(
                     "{}\\{}:::{}:::",
                     cred.domain,
@@ -1781,20 +2471,87 @@ fn print_ntlm(credentials: &[Credential]) {
     }
 }
 
-#[cfg(any(
-    feature = "vmware",
-    feature = "vbox",
-    feature = "qemu",
-    feature = "hyperv"
-))]
-fn print_hashcat(credentials: &[Credential]) {
-    let zero_hash = [0u8; 16];
+fn print_hashcat(credentials: &[Credential], providers: &[String]) {
+    let mut seen = std::collections::HashSet::new();
     for cred in credentials.iter().filter(|c| c.has_credentials()) {
-        // hashcat mode 1000 (NTLM)
+        if !should_show(providers, "msv") {
+            continue;
+        }
+        // hashcat mode 1000 (NTLM) with --username format
         if let Some(msv) = &cred.msv {
-            if msv.nt_hash != zero_hash {
-                println!("{}", hex::encode(msv.nt_hash));
+            let key = (cred.username.clone(), cred.domain.clone(), msv.nt_hash);
+            if msv.nt_hash != ZERO_HASH_16 && seen.insert(key) {
+                println!("{}\\{}:{}", cred.domain, cred.username, hex::encode(msv.nt_hash));
             }
+        }
+    }
+}
+
+fn print_brief(credentials: &[Credential], providers: &[String]) {
+    for cred in credentials.iter().filter(|c| c.has_credentials()) {
+        let identity = if cred.domain.is_empty() {
+            cred.username.clone()
+        } else {
+            format!("{}\\{}", cred.domain, cred.username)
+        };
+        let mut lines: Vec<String> = Vec::new();
+
+        if should_show(providers, "msv") {
+            if let Some(msv) = &cred.msv {
+                if msv.nt_hash != ZERO_HASH_16 {
+                    lines.push(format!("    NT      : {}", hex::encode(msv.nt_hash)));
+                }
+            }
+        }
+        if should_show(providers, "wdigest") {
+            if let Some(wd) = &cred.wdigest {
+                if !wd.password.is_empty() {
+                    lines.push(format!("    WDigest : {}", fmt_password(&wd.password, &COLORS_OFF)));
+                }
+            }
+        }
+        if should_show(providers, "kerberos") {
+            if let Some(krb) = &cred.kerberos {
+                if !krb.password.is_empty() {
+                    lines.push(format!("    Kerberos: {}", fmt_password(&krb.password, &COLORS_OFF)));
+                }
+            }
+        }
+        if should_show(providers, "tspkg") {
+            if let Some(ts) = &cred.tspkg {
+                if !ts.password.is_empty() {
+                    lines.push(format!("    TsPkg   : {}", fmt_password(&ts.password, &COLORS_OFF)));
+                }
+            }
+        }
+        if should_show(providers, "ssp") {
+            if let Some(ssp) = &cred.ssp {
+                if !ssp.password.is_empty() {
+                    lines.push(format!("    SSP     : {}", fmt_password(&ssp.password, &COLORS_OFF)));
+                }
+            }
+        }
+        if should_show(providers, "livessp") {
+            if let Some(live) = &cred.livessp {
+                if !live.password.is_empty() {
+                    lines.push(format!("    LiveSSP : {}", fmt_password(&live.password, &COLORS_OFF)));
+                }
+            }
+        }
+        if should_show(providers, "credman") {
+            for cm in &cred.credman {
+                if !cm.password.is_empty() {
+                    lines.push(format!("    CredMan : {} ({})", fmt_password(&cm.password, &COLORS_OFF), cm.target));
+                }
+            }
+        }
+
+        if !lines.is_empty() {
+            println!("  {}", identity);
+            for line in &lines {
+                println!("{}", line);
+            }
+            println!();
         }
     }
 }

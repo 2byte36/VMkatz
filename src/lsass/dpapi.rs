@@ -1,39 +1,62 @@
 use crate::error::Result;
 use crate::lsass::crypto::{self, CryptoKeys};
 use crate::lsass::patterns;
-use crate::lsass::types::DpapiCredential;
+use crate::lsass::types::{Arch, DpapiCredential, read_ptr, is_valid_user_ptr};
 use crate::memory::{PhysicalMemory, VirtualMemory};
-use crate::paging::translate::PageTableWalker;
+use crate::paging::translate::{PageTableWalker, PaePageTableWalker};
 use crate::pe::parser::PeHeaders;
 
-/// KIWI_MASTERKEY_CACHE_ENTRY offsets (same for all x64 Windows versions).
-///
-/// Layout (verified against mimikatz + pypykatz):
-///   +0x00: Flink (8B)
-///   +0x08: Blink (8B)
-///   +0x10: LUID (8B)
-///   +0x18: GUID (16B)
-///   +0x28: insertTime (FILETIME, 8B)
-///   +0x30: keySize (ULONG, 4B)
-///   +0x34: key[] (encrypted, variable length)
-const OFF_FLINK: u64 = 0x00;
-const OFF_LUID: u64 = 0x10;
-const OFF_GUID: u64 = 0x18;
-const OFF_KEY_SIZE: u64 = 0x30;
-const OFF_KEY_DATA: u64 = 0x34;
+/// Per-arch offsets for KIWI_MASTERKEY_CACHE_ENTRY.
+struct DpapiOffsets {
+    luid: u64,
+    guid: u64,
+    key_size: u64,
+    key_data: u64,
+}
 
-/// Extract DPAPI master key cache entries from lsasrv.dll.
+const DPAPI_OFFSETS_X64: DpapiOffsets = DpapiOffsets {
+    luid: 0x10,
+    guid: 0x18,
+    key_size: 0x30,
+    key_data: 0x34,
+};
+
+const DPAPI_OFFSETS_X86: DpapiOffsets = DpapiOffsets {
+    luid: 0x08,
+    guid: 0x10,
+    key_size: 0x28,
+    key_data: 0x2C,
+};
+
+/// Extract DPAPI master key cache entries from lsasrv.dll (unified x64/x86).
 ///
 /// Keys are stored encrypted with LsaProtectMemory (3DES/AES) and must be decrypted.
-pub fn extract_dpapi_credentials(
-    vmem: &impl VirtualMemory,
+///
+/// Resolution strategy (three fallback levels):
+///   1. .text pattern scan + LEA/abs address resolution
+///   2. LEA-to-data scan (x64) or abs-to-data scan (x86) over all .text instructions
+///   3. .data section heuristic scan for LIST_ENTRY heads
+pub fn extract_dpapi_credentials_arch(
+    vmem: &dyn VirtualMemory,
     lsasrv_base: u64,
     _lsasrv_size: u32,
     keys: &CryptoKeys,
+    arch: Arch,
 ) -> Result<Vec<(u64, DpapiCredential)>> {
+    let offsets = match arch {
+        Arch::X64 => &DPAPI_OFFSETS_X64,
+        Arch::X86 => &DPAPI_OFFSETS_X86,
+    };
+
     let pe = PeHeaders::parse_from_memory(vmem, lsasrv_base)?;
 
-    // Try .text pattern scan first, then LEA-to-data scan, then .data section scan
+    // Select arch-appropriate patterns
+    let pattern_list = match arch {
+        Arch::X64 => patterns::DPAPI_MASTER_KEY_PATTERNS,
+        Arch::X86 => patterns::DPAPI_MASTER_KEY_PATTERNS_X86,
+    };
+
+    // Try .text pattern scan first, then LEA/abs-to-data scan, then .data section scan
     let list_addr = match pe.find_section(".text") {
         Some(text) => {
             let text_base = lsasrv_base + text.virtual_address as u64;
@@ -41,46 +64,69 @@ pub fn extract_dpapi_credentials(
                 vmem,
                 text_base,
                 text.virtual_size,
-                patterns::DPAPI_MASTER_KEY_PATTERNS,
+                pattern_list,
                 "g_MasterKeyCacheList",
             ) {
                 Ok((pattern_addr, _)) => {
-                    patterns::find_list_via_lea(vmem, pattern_addr, "g_MasterKeyCacheList")?
+                    resolve_list_addr(vmem, &pe, lsasrv_base, pattern_addr, arch)?
                 }
                 Err(e) => {
                     log::debug!(
-                        "DPAPI .text pattern scan failed ({}), trying LEA-to-data scan",
+                        "DPAPI .text pattern scan failed ({}), trying instruction scan",
                         e
                     );
-                    match find_dpapi_list_via_lea_scan(vmem, &pe, lsasrv_base) {
+                    match find_dpapi_list_via_insn_scan(vmem, &pe, lsasrv_base, offsets, arch) {
                         Ok(addr) => addr,
                         Err(e2) => {
                             log::debug!(
-                                "DPAPI LEA-to-data scan failed ({}), trying .data fallback",
+                                "DPAPI instruction scan failed ({}), trying .data fallback",
                                 e2
                             );
-                            find_dpapi_list_in_data(vmem, &pe, lsasrv_base)?
+                            find_dpapi_list_in_data(vmem, &pe, lsasrv_base, offsets, arch)?
                         }
                     }
                 }
             }
         }
-        None => find_dpapi_list_in_data(vmem, &pe, lsasrv_base)?,
+        None => find_dpapi_list_in_data(vmem, &pe, lsasrv_base, offsets, arch)?,
     };
 
-    log::info!("DPAPI g_MasterKeyCacheList at 0x{:x}", list_addr);
-    walk_masterkey_list(vmem, list_addr, keys)
+    log::info!("DPAPI g_MasterKeyCacheList at 0x{:x} (arch={:?})", list_addr, arch);
+    walk_masterkey_list(vmem, list_addr, keys, offsets, arch)
+}
+
+/// Resolve the list address from a pattern match, using arch-appropriate instruction decoding.
+fn resolve_list_addr(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    dll_base: u64,
+    pattern_addr: u64,
+    arch: Arch,
+) -> Result<u64> {
+    match arch {
+        Arch::X64 => patterns::find_list_via_lea(vmem, pattern_addr, "g_MasterKeyCacheList"),
+        Arch::X86 => {
+            let ds = pe.find_section(".data").ok_or_else(|| {
+                crate::error::VmkatzError::PatternNotFound(".data section in lsasrv.dll".to_string())
+            })?;
+            let data_base = dll_base + ds.virtual_address as u64;
+            let data_end = data_base + ds.virtual_size as u64;
+            patterns::find_list_via_abs(vmem, pattern_addr, dll_base, data_base, data_end, "dpapi")
+        }
+    }
 }
 
 /// Walk the g_MasterKeyCacheList linked list and extract entries.
 fn walk_masterkey_list(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     list_addr: u64,
     keys: &CryptoKeys,
+    offsets: &DpapiOffsets,
+    arch: Arch,
 ) -> Result<Vec<(u64, DpapiCredential)>> {
     let mut results = Vec::new();
 
-    let head_flink = vmem.read_virt_u64(list_addr)?;
+    let head_flink = read_ptr(vmem, list_addr, arch)?;
     if head_flink == 0 || head_flink == list_addr {
         log::info!("DPAPI: master key cache is empty");
         return Ok(results);
@@ -95,11 +141,11 @@ fn walk_masterkey_list(
         }
         visited.insert(current);
 
-        if let Some(cred) = read_and_decrypt_entry(vmem, current, keys) {
+        if let Some(cred) = read_and_decrypt_entry(vmem, current, keys, offsets) {
             results.push(cred);
         }
 
-        current = match vmem.read_virt_u64(current + OFF_FLINK) {
+        current = match read_ptr(vmem, current, arch) {
             Ok(f) => f,
             Err(_) => break,
         };
@@ -111,24 +157,25 @@ fn walk_masterkey_list(
 
 /// Read a single DPAPI cache entry and decrypt its key.
 fn read_and_decrypt_entry(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     entry_addr: u64,
     keys: &CryptoKeys,
+    offsets: &DpapiOffsets,
 ) -> Option<(u64, DpapiCredential)> {
-    let luid = vmem.read_virt_u64(entry_addr + OFF_LUID).ok()?;
-    let key_size = vmem.read_virt_u32(entry_addr + OFF_KEY_SIZE).ok()?;
+    let luid = vmem.read_virt_u64(entry_addr + offsets.luid).ok()?;
+    let key_size = vmem.read_virt_u32(entry_addr + offsets.key_size).ok()?;
     if key_size == 0 || key_size > 256 {
         return None;
     }
 
-    let guid_bytes = vmem.read_virt_bytes(entry_addr + OFF_GUID, 16).ok()?;
+    let guid_bytes = vmem.read_virt_bytes(entry_addr + offsets.guid, 16).ok()?;
     if guid_bytes.iter().all(|&b| b == 0) {
         return None;
     }
     let guid = format_guid(&guid_bytes);
 
     let enc_key = vmem
-        .read_virt_bytes(entry_addr + OFF_KEY_DATA, key_size as usize)
+        .read_virt_bytes(entry_addr + offsets.key_data, key_size as usize)
         .ok()?;
 
     // Decrypt with 3DES/AES (same as all other credential providers)
@@ -152,24 +199,28 @@ fn read_and_decrypt_entry(
         DpapiCredential {
             guid,
             key: dec_key,
-            key_size,
             sha1_masterkey: sha1,
         },
     ))
 }
 
-/// Scan lsasrv.dll .text for LEA instructions referencing .data addresses,
+/// Scan lsasrv.dll .text for instructions referencing .data addresses,
 /// then validate each target as a potential g_MasterKeyCacheList.
-fn find_dpapi_list_via_lea_scan(
-    vmem: &impl VirtualMemory,
+///
+/// x64: scans for RIP-relative LEA instructions (REX.W + 8D modrm disp32).
+/// x86: scans for absolute address references (LEA/MOV/PUSH with abs32).
+fn find_dpapi_list_via_insn_scan(
+    vmem: &dyn VirtualMemory,
     pe: &PeHeaders,
     lsasrv_base: u64,
+    offsets: &DpapiOffsets,
+    arch: Arch,
 ) -> Result<u64> {
     let text = pe.find_section(".text").ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound(".text section in lsasrv.dll".to_string())
+        crate::error::VmkatzError::PatternNotFound(".text section in lsasrv.dll".to_string())
     })?;
     let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound(".data section in lsasrv.dll".to_string())
+        crate::error::VmkatzError::PatternNotFound(".data section in lsasrv.dll".to_string())
     })?;
 
     let text_base = lsasrv_base + text.virtual_address as u64;
@@ -187,132 +238,186 @@ fn find_dpapi_list_via_lea_scan(
             Err(_) => continue,
         };
 
-        for i in 0..chunk.len().saturating_sub(7) {
-            let rex = chunk[i];
-            if rex != 0x48 && rex != 0x4C {
-                continue;
+        match arch {
+            Arch::X64 => {
+                // Scan for RIP-relative LEA: REX.W(48/4C) 8D modrm(xx05) disp32
+                for i in 0..chunk.len().saturating_sub(7) {
+                    let rex = chunk[i];
+                    if rex != 0x48 && rex != 0x4C {
+                        continue;
+                    }
+                    if chunk[i + 1] != 0x8D {
+                        continue;
+                    }
+                    let modrm = chunk[i + 2];
+                    if modrm & 0xC7 != 0x05 {
+                        continue;
+                    }
+                    let disp = i32::from_le_bytes([
+                        chunk[i + 3],
+                        chunk[i + 4],
+                        chunk[i + 5],
+                        chunk[i + 6],
+                    ]);
+                    let rip = text_base + (chunk_off + i) as u64 + 7;
+                    let target = (rip as i64 + disp as i64) as u64;
+                    if target >= data_base && target < data_end {
+                        candidates.push(target);
+                    }
+                }
             }
-            if chunk[i + 1] != 0x8D {
-                continue;
+            Arch::X86 => {
+                // Scan for abs32 references: LEA reg,[abs32], MOV EAX,[abs32], PUSH abs32
+                for i in 0..chunk.len().saturating_sub(6) {
+                    let (is_abs, abs_off) = match chunk[i] {
+                        0x8D | 0x8B if i + 1 < chunk.len() && (chunk[i + 1] & 0xC7) == 0x05 => {
+                            (true, i + 2)
+                        }
+                        0x68 | 0xA1 | 0xA3 => (true, i + 1),
+                        _ => (false, 0),
+                    };
+                    if !is_abs || abs_off + 4 > chunk.len() {
+                        continue;
+                    }
+                    let target = u32::from_le_bytes([
+                        chunk[abs_off],
+                        chunk[abs_off + 1],
+                        chunk[abs_off + 2],
+                        chunk[abs_off + 3],
+                    ]) as u64;
+                    if target >= data_base && target < data_end {
+                        candidates.push(target);
+                    }
+                }
             }
-            let modrm = chunk[i + 2];
-            if modrm & 0xC7 != 0x05 {
-                continue;
-            }
-            let disp = i32::from_le_bytes([chunk[i + 3], chunk[i + 4], chunk[i + 5], chunk[i + 6]]);
-            let rip = text_base + (chunk_off + i) as u64 + 7;
-            let target = (rip as i64 + disp as i64) as u64;
-            if target < data_base || target >= data_end {
-                continue;
-            }
-            candidates.push(target);
         }
     }
 
     candidates.sort_unstable();
     candidates.dedup();
     log::debug!(
-        "DPAPI LEA scan: {} unique .data targets found",
-        candidates.len()
+        "DPAPI instruction scan: {} unique .data targets found (arch={:?})",
+        candidates.len(),
+        arch,
     );
 
     for target in &candidates {
-        if validate_dpapi_list_head(vmem, *target, lsasrv_base) {
+        if validate_dpapi_list_head(vmem, *target, lsasrv_base, offsets, arch) {
             log::info!(
-                "DPAPI LEA scan: found g_MasterKeyCacheList at 0x{:x}",
+                "DPAPI instruction scan: found g_MasterKeyCacheList at 0x{:x}",
                 target
             );
             return Ok(*target);
         }
     }
 
-    Err(crate::error::GovmemError::PatternNotFound(
-        "g_MasterKeyCacheList via LEA-to-data scan".to_string(),
+    Err(crate::error::VmkatzError::PatternNotFound(
+        "g_MasterKeyCacheList via instruction scan".to_string(),
     ))
 }
 
 /// Fallback: scan lsasrv.dll .data section for g_MasterKeyCacheList LIST_ENTRY head.
 fn find_dpapi_list_in_data(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     pe: &PeHeaders,
     lsasrv_base: u64,
+    offsets: &DpapiOffsets,
+    arch: Arch,
 ) -> Result<u64> {
     let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound(".data section in lsasrv.dll".to_string())
+        crate::error::VmkatzError::PatternNotFound(".data section in lsasrv.dll".to_string())
     })?;
 
     let data_base = lsasrv_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x20000);
     let data = vmem.read_virt_bytes(data_base, data_size)?;
+    let step = arch.ptr_size() as usize;
 
     log::debug!(
-        "DPAPI: scanning .data for g_MasterKeyCacheList: base=0x{:x} size=0x{:x}",
+        "DPAPI: scanning .data for g_MasterKeyCacheList: base=0x{:x} size=0x{:x} arch={:?}",
         data_base,
-        data_size
+        data_size,
+        arch,
     );
 
-    for off in (0..data_size.saturating_sub(16)).step_by(8) {
-        let flink = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let blink = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
-        if flink < 0x10000 || (flink >> 48) != 0 || blink < 0x10000 || (blink >> 48) != 0 {
+    for off in (0..data_size.saturating_sub(step * 2)).step_by(step) {
+        let flink = match arch {
+            Arch::X64 => super::types::read_u64_le(&data, off).unwrap_or(0),
+            Arch::X86 => super::types::read_u32_le(&data, off).unwrap_or(0) as u64,
+        };
+        let blink = match arch {
+            Arch::X64 => super::types::read_u64_le(&data, off + 8).unwrap_or(0),
+            Arch::X86 => super::types::read_u32_le(&data, off + step).unwrap_or(0) as u64,
+        };
+
+        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
             continue;
         }
+        // Entry flink should NOT point back into lsasrv.dll itself
         if flink >= lsasrv_base && flink < lsasrv_base + 0x200000 {
             continue;
         }
         let list_addr = data_base + off as u64;
+        // Skip empty (self-referencing) lists
         if flink == list_addr && blink == list_addr {
             continue;
         }
-        if validate_dpapi_list_head(vmem, list_addr, lsasrv_base) {
+        if validate_dpapi_list_head(vmem, list_addr, lsasrv_base, offsets, arch) {
             log::debug!("DPAPI: found g_MasterKeyCacheList at 0x{:x}", list_addr);
             return Ok(list_addr);
         }
     }
 
-    Err(crate::error::GovmemError::PatternNotFound(
+    Err(crate::error::VmkatzError::PatternNotFound(
         "g_MasterKeyCacheList in lsasrv.dll .data section".to_string(),
     ))
 }
 
 /// Validate a candidate LIST_ENTRY head as g_MasterKeyCacheList.
-fn validate_dpapi_list_head(vmem: &impl VirtualMemory, head: u64, lsasrv_base: u64) -> bool {
-    let flink = match vmem.read_virt_u64(head) {
+fn validate_dpapi_list_head(
+    vmem: &dyn VirtualMemory,
+    head: u64,
+    lsasrv_base: u64,
+    offsets: &DpapiOffsets,
+    arch: Arch,
+) -> bool {
+    let flink = match read_ptr(vmem, head, arch) {
         Ok(f) => f,
         Err(_) => return false,
     };
-    if flink < 0x10000 || (flink >> 48) != 0 || flink == head {
+    if !is_valid_user_ptr(flink, arch) || flink == head {
         return false;
     }
+    // Entry flink should NOT point back into lsasrv.dll itself
     if flink >= lsasrv_base && flink < lsasrv_base + 0x200000 {
         return false;
     }
     // Entry's Blink should point back to head
-    let entry_blink = match vmem.read_virt_u64(flink + 8) {
+    let entry_blink = match read_ptr(vmem, flink + arch.ptr_size(), arch) {
         Ok(b) => b,
         Err(_) => return false,
     };
     if entry_blink != head {
         return false;
     }
-    // LUID at +0x10 should be reasonable
-    let luid = match vmem.read_virt_u64(flink + OFF_LUID) {
+    // LUID should be reasonable (fits in 32 bits)
+    let luid = match vmem.read_virt_u64(flink + offsets.luid) {
         Ok(l) => l,
         Err(_) => return false,
     };
     if luid > 0xFFFF_FFFF {
         return false;
     }
-    // key_size at +0x30 should be 32, 48, or 64
-    let key_size = match vmem.read_virt_u32(flink + OFF_KEY_SIZE) {
+    // key_size should be 32, 48, or 64
+    let key_size = match vmem.read_virt_u32(flink + offsets.key_size) {
         Ok(k) => k,
         Err(_) => return false,
     };
     if !matches!(key_size, 32 | 48 | 64) {
         return false;
     }
-    // GUID at +0x18 should not be all zeros
-    let guid_bytes = match vmem.read_virt_bytes(flink + OFF_GUID, 16) {
+    // GUID should not be all zeros
+    let guid_bytes = match vmem.read_virt_bytes(flink + offsets.guid, 16) {
         Ok(g) => g,
         Err(_) => return false,
     };
@@ -328,6 +433,9 @@ fn validate_dpapi_list_head(vmem: &impl VirtualMemory, head: u64, lsasrv_base: u
 /// When pattern-based scanning fails (lsasrv.dll .data paged out), directly
 /// scan LSASS physical pages for KIWI_MASTERKEY_CACHE_ENTRY structures.
 ///
+/// Note: physical scan uses hardcoded x64 offsets because it runs only on
+/// VM snapshot paths where x64 is guaranteed.
+///
 /// Structure (all x64 Windows):
 ///   +0x00: Flink (heap ptr)
 ///   +0x08: Blink (heap ptr or .data addr)
@@ -339,7 +447,7 @@ fn validate_dpapi_list_head(vmem: &impl VirtualMemory, head: u64, lsasrv_base: u
 pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     keys: &CryptoKeys,
 ) -> Vec<(u64, DpapiCredential)> {
     let walker = PageTableWalker::new(phys);
@@ -377,18 +485,19 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
         candidates.len()
     );
 
+    let offsets = &DPAPI_OFFSETS_X64;
     let mut seen_guids = std::collections::HashSet::new();
 
     for vaddr in &candidates {
-        let luid = vmem.read_virt_u64(*vaddr + OFF_LUID).unwrap_or(0);
+        let luid = vmem.read_virt_u64(*vaddr + offsets.luid).unwrap_or(0);
         if luid == 0 || luid > 0xFFFF_FFFF {
             continue;
         }
-        let key_size = vmem.read_virt_u32(*vaddr + OFF_KEY_SIZE).unwrap_or(0);
+        let key_size = vmem.read_virt_u32(*vaddr + offsets.key_size).unwrap_or(0);
         if !matches!(key_size, 32 | 48 | 64) {
             continue;
         }
-        let guid_bytes = match vmem.read_virt_bytes(*vaddr + OFF_GUID, 16) {
+        let guid_bytes = match vmem.read_virt_bytes(*vaddr + offsets.guid, 16) {
             Ok(g) => g,
             Err(_) => continue,
         };
@@ -407,7 +516,7 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
             continue;
         }
 
-        let enc_key = match vmem.read_virt_bytes(*vaddr + OFF_KEY_DATA, key_size as usize) {
+        let enc_key = match vmem.read_virt_bytes(*vaddr + offsets.key_data, key_size as usize) {
             Ok(k) => k,
             Err(_) => continue,
         };
@@ -434,7 +543,6 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
             DpapiCredential {
                 guid,
                 key: dec_key,
-                key_size,
                 sha1_masterkey: sha1,
             },
         ));
@@ -444,121 +552,291 @@ pub fn extract_dpapi_physical_scan<P: PhysicalMemory>(
     results
 }
 
+/// Extract DPAPI master keys from x86 LSASS by scanning PAE page tables.
+///
+/// Enumerates present user-mode pages via PAE page table walk, then runs the
+/// arch-aware vmem scan on each page.
+pub fn extract_dpapi_physical_scan_x86<P: PhysicalMemory>(
+    phys: &P,
+    lsass_dtb: u64,
+    vmem: &dyn VirtualMemory,
+    keys: &CryptoKeys,
+) -> Vec<(u64, DpapiCredential)> {
+    let walker = PaePageTableWalker::new(phys);
+    let mut regions: Vec<(u64, u64)> = Vec::new();
+
+    walker.enumerate_present_pages(lsass_dtb, |mapping| {
+        if mapping.size == 0x1000 {
+            regions.push((mapping.vaddr, mapping.size));
+        }
+    });
+
+    log::info!(
+        "DPAPI x86 physical scan: {} present pages, running vmem scan...",
+        regions.len()
+    );
+
+    extract_dpapi_vmem_scan(vmem, &regions, keys, Arch::X86)
+}
+
+/// Extract DPAPI master keys by scanning virtual memory regions (minidump fallback).
+///
+/// Equivalent of `extract_dpapi_physical_scan` but for minidumps where we don't have
+/// PhysicalMemory. Scans all provided region ranges for DPAPI entry signatures.
+pub fn extract_dpapi_vmem_scan(
+    vmem: &dyn VirtualMemory,
+    region_ranges: &[(u64, u64)],
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Vec<(u64, DpapiCredential)> {
+    let offsets = match arch {
+        Arch::X64 => &DPAPI_OFFSETS_X64,
+        Arch::X86 => &DPAPI_OFFSETS_X86,
+    };
+    let ptr_size = arch.ptr_size() as usize;
+    // Minimum entry size: key_data offset + 64 bytes of key
+    let min_entry = offsets.key_data as usize + 64;
+
+    let mut results = Vec::new();
+    let mut seen_guids = std::collections::HashSet::new();
+    let mut total_scanned = 0u64;
+    let mut candidates = 0u64;
+
+    for &(base, size) in region_ranges {
+        let chunk_size = size as usize;
+        if chunk_size < min_entry {
+            continue;
+        }
+        let data = match vmem.read_virt_bytes(base, chunk_size) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        total_scanned += size;
+
+        for off in (0..chunk_size.saturating_sub(min_entry)).step_by(ptr_size) {
+            // Check pointer-like flink/blink at the start
+            let (flink, blink) = if arch == Arch::X64 {
+                (
+                    super::types::read_u64_le(&data, off).unwrap_or(0),
+                    super::types::read_u64_le(&data, off + 8).unwrap_or(0),
+                )
+            } else {
+                (
+                    super::types::read_u32_le(&data, off).unwrap_or(0) as u64,
+                    super::types::read_u32_le(&data, off + 4).unwrap_or(0) as u64,
+                )
+            };
+            if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
+                continue;
+            }
+
+            // LUID
+            let luid_off = off + offsets.luid as usize;
+            if luid_off + 8 > data.len() { continue; }
+            let luid = super::types::read_u64_le(&data, luid_off).unwrap_or(0);
+            if luid == 0 || luid > 0xFFFF_FFFF {
+                continue;
+            }
+
+            // GUID
+            let guid_off = off + offsets.guid as usize;
+            if guid_off + 16 > data.len() { continue; }
+            let guid_bytes = &data[guid_off..guid_off + 16];
+            if !validate_dpapi_guid(guid_bytes) {
+                continue;
+            }
+
+            // key_size
+            let ks_off = off + offsets.key_size as usize;
+            if ks_off + 4 > data.len() { continue; }
+            let key_size = super::types::read_u32_le(&data, ks_off).unwrap_or(0);
+            if !matches!(key_size, 32 | 48 | 64) {
+                continue;
+            }
+
+            candidates += 1;
+            let vaddr = base + off as u64;
+            let guid = format_guid(guid_bytes);
+            if !seen_guids.insert(guid.clone()) {
+                continue;
+            }
+
+            // Read encrypted key from virtual memory (may cross page boundary)
+            let enc_key = match vmem.read_virt_bytes(vaddr + offsets.key_data, key_size as usize) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+            if enc_key.iter().all(|&b| b == 0) {
+                continue;
+            }
+
+            let dec_key = match crypto::decrypt_credential(keys, &enc_key) {
+                Ok(k) => k,
+                Err(_) => continue,
+            };
+
+            let sha1 = sha1_digest(&dec_key);
+            log::info!(
+                "DPAPI vmem-scan: LUID=0x{:x} GUID={} key_size={}",
+                luid, guid, key_size
+            );
+            results.push((
+                luid,
+                DpapiCredential {
+                    guid,
+                    key: dec_key,
+                    sha1_masterkey: sha1,
+                },
+            ));
+        }
+    }
+
+    log::info!(
+        "DPAPI vmem scan: scanned {} bytes, {} candidates, {} entries extracted",
+        total_scanned, candidates, results.len()
+    );
+    results
+}
+
 /// Check if a page region at `off` matches a DPAPI master key cache entry signature.
-fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
+///
+/// Uses x64 offsets (only called from physical scan / carve mode which are x64-only).
+pub(crate) fn try_dpapi_entry_match(page: &[u8], off: usize) -> bool {
     if off + 0x74 > page.len() {
         return false;
     }
     // Flink at +0x00: valid user-mode pointer
-    let flink = u64::from_le_bytes(page[off..off + 8].try_into().unwrap());
+    let flink = super::types::read_u64_le(page, off).unwrap_or(0);
     if flink < 0x10000 || (flink >> 48) != 0 {
         return false;
     }
     // Blink at +0x08: valid pointer
-    let blink = u64::from_le_bytes(page[off + 8..off + 16].try_into().unwrap());
+    let blink = super::types::read_u64_le(page, off + 8).unwrap_or(0);
     if blink < 0x10000 || (blink >> 48) != 0 {
         return false;
     }
     // LUID at +0x10: reasonable
-    let luid = u64::from_le_bytes(page[off + 0x10..off + 0x18].try_into().unwrap());
+    let luid = super::types::read_u64_le(page, off + 0x10).unwrap_or(0);
     if luid == 0 || luid > 0xFFFF_FFFF {
         return false;
     }
-    // GUID at +0x18: first u32 non-zero
-    let guid_d1 = u32::from_le_bytes(page[off + 0x18..off + 0x1C].try_into().unwrap());
-    if guid_d1 == 0 {
+
+    if !validate_dpapi_guid(&page[off + 0x18..off + 0x28]) {
         return false;
     }
-    // GUID should not be all ASCII (false positive filter)
-    let guid_slice = &page[off + 0x18..off + 0x28];
-    if guid_slice
-        .iter()
-        .all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ')
-    {
-        return false;
-    }
+
     // insertTime at +0x28: FILETIME should be a reasonable date (2000-2040)
-    // High DWORD of FILETIME for year 2000 ≈ 0x01BF..., year 2040 ≈ 0x01E0...
-    let ft_high = u32::from_le_bytes(page[off + 0x2C..off + 0x30].try_into().unwrap());
+    // High DWORD of FILETIME for year 2000 ~ 0x01BF..., year 2040 ~ 0x01E0...
+    let ft_high = super::types::read_u32_le(page, off + 0x2C).unwrap_or(0);
     if !(0x01BF_0000..=0x01E0_0000).contains(&ft_high) {
         return false;
     }
-    // key_size at +0x30: must be 32, 48, or 64
-    let key_size = u32::from_le_bytes(page[off + 0x30..off + 0x34].try_into().unwrap());
-    if !matches!(key_size, 32 | 48 | 64) {
+    // key_size at +0x30: DPAPI master keys are always 64 bytes (SHA-512 derived).
+    // In carve mode (physical scan), only accept 64 to reduce false positives.
+    // 32/48 values pass structure validation but are invariably false positives.
+    let key_size = super::types::read_u32_le(page, off + 0x30).unwrap_or(0);
+    if key_size != 64 {
         return false;
     }
     // key data at +0x34: first 16 bytes shouldn't be all zero
-    let key_start = &page[off + 0x34..off + 0x34 + std::cmp::min(key_size as usize, 16)];
+    let key_start = &page[off + 0x34..off + 0x34 + 16];
     if key_start.iter().all(|&b| b == 0) {
         return false;
     }
     true
 }
 
-/// SHA-1 digest for computing sha1_masterkey.
-fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
-        0x67452301u32,
-        0xEFCDAB89u32,
-        0x98BADCFEu32,
-        0x10325476u32,
-        0xC3D2E1F0u32,
-    );
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+/// Validate GUID bytes from a candidate DPAPI entry.
+/// Real GUIDs (v4 random) have high entropy and non-zero middle fields.
+fn validate_dpapi_guid(guid: &[u8]) -> bool {
+    debug_assert!(guid.len() == 16);
+
+    // D1 (first u32) non-zero
+    let d1 = u32::from_le_bytes(guid[0..4].try_into().unwrap());
+    if d1 == 0 {
+        return false;
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-                _ => (b ^ c ^ d, 0xCA62C1D6u32),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
+    // D2+D3 (bytes 4..8) should not both be zero -- real GUIDs have random fields here.
+    // Pattern like 00000381-0000-0000-... has D2=0, D3=0 which is not a real GUID.
+    let d2 = u16::from_le_bytes(guid[4..6].try_into().unwrap());
+    let d3 = u16::from_le_bytes(guid[6..8].try_into().unwrap());
+    if d2 == 0 && d3 == 0 {
+        return false;
     }
-    let mut r = [0u8; 20];
-    r[0..4].copy_from_slice(&h0.to_be_bytes());
-    r[4..8].copy_from_slice(&h1.to_be_bytes());
-    r[8..12].copy_from_slice(&h2.to_be_bytes());
-    r[12..16].copy_from_slice(&h3.to_be_bytes());
-    r[16..20].copy_from_slice(&h4.to_be_bytes());
-    r
+    // Not all ASCII printable (filters text strings mistaken for GUIDs)
+    if guid.iter().all(|&b| b.is_ascii_graphic() || b == 0 || b == b' ') {
+        return false;
+    }
+    // Entropy: random GUIDs have >=8 unique bytes out of 16 (v4 has 122 random bits).
+    // Structured false positives typically have 5-6 unique bytes.
+    if super::crypto::count_unique_bytes(guid) < 8 {
+        return false;
+    }
+    true
 }
+
+/// Extract a DPAPI master key entry from raw page bytes at a given offset.
+///
+/// Used by carve mode to extract DPAPI entries directly from physical pages.
+/// All fields are read from page bytes at fixed x64 offsets -- no virtual memory needed.
+#[cfg(feature = "carve")]
+pub(crate) fn extract_dpapi_from_raw_page(
+    page: &[u8],
+    off: usize,
+    keys: &CryptoKeys,
+) -> Option<(u64, DpapiCredential)> {
+    if off + 0x74 > page.len() {
+        return None;
+    }
+
+    let luid = u64::from_le_bytes(page[off + 0x10..off + 0x18].try_into().ok()?);
+    if luid == 0 || luid > 0xFFFF_FFFF {
+        return None;
+    }
+
+    let guid_bytes = &page[off + 0x18..off + 0x28];
+    if !validate_dpapi_guid(guid_bytes) {
+        return None;
+    }
+    let guid = format_guid(guid_bytes);
+
+    // key_size must be 64 (DPAPI master keys are SHA-512 derived)
+    let key_size =
+        u32::from_le_bytes(page[off + 0x30..off + 0x34].try_into().ok()?);
+    if key_size != 64 {
+        return None;
+    }
+    if off + 0x34 + 64 > page.len() {
+        return None;
+    }
+
+    let enc_key = &page[off + 0x34..off + 0x74];
+    if enc_key.iter().all(|&b| b == 0) {
+        return None;
+    }
+
+    let dec_key = crypto::decrypt_credential(keys, enc_key).ok()?;
+
+    // Post-decryption entropy check: real master keys have high entropy.
+    // Reject if fewer than 16 unique bytes in 64 bytes (random data has ~55+).
+    if super::crypto::count_unique_bytes(&dec_key) < 16 {
+        return None;
+    }
+
+    let sha1 = sha1_digest(&dec_key);
+
+    Some((
+        luid,
+        DpapiCredential {
+            guid,
+            key: dec_key,
+            sha1_masterkey: sha1,
+        },
+    ))
+}
+
+/// SHA-1 digest for computing sha1_masterkey.
+use crate::utils::sha1_digest;
 
 /// Format a 16-byte GUID as "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx".
 fn format_guid(bytes: &[u8]) -> String {

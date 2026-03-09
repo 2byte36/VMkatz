@@ -10,7 +10,7 @@
 //! - Tagged/fixed/variable column value extraction
 //! - Long value (separated record) resolution
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use std::collections::HashMap;
 
 /// ESE database backed by a byte slice.
@@ -26,6 +26,7 @@ pub struct EseDb<'a> {
 pub struct EseColumn {
     pub id: u32,
     pub name: String,
+    #[allow(dead_code)] // stored for debugging, not read at runtime
     pub col_type: u32,
     pub offset: u16,
     pub size: u16,
@@ -46,8 +47,12 @@ struct EseTable {
 }
 
 
-// ESE page flags
+// ESE page flags (from JET_bitXxx / esent.h)
+const PAGE_FLAG_ROOT: u32 = 0x01;
 const PAGE_FLAG_LEAF: u32 = 0x02;
+const PAGE_FLAG_SPACE_TREE: u32 = 0x08;
+const PAGE_FLAG_INDEX: u32 = 0x20;
+const PAGE_FLAG_NEW_CHECKSUM: u32 = 0x2000;
 
 // ESE column types (used in fixed_size_for_type)
 const JET_COLTYPBIT: u32 = 1;
@@ -187,7 +192,7 @@ impl<'a> EseDb<'a> {
             let offset = ((raw >> 16) & 0x1FFF) as usize;
             let flags = ((raw >> 29) & 0x07) as u8;
             (offset, size, flags)
-        } else if page_flags & 0x2000 != 0 {
+        } else if page_flags & PAGE_FLAG_NEW_CHECKSUM != 0 {
             // Large pages with new checksum: cb_ & 0x7FFF, ib_ & 0x7FFF
             let size = (raw & 0x7FFF) as usize;
             let offset = ((raw >> 16) & 0x7FFF) as usize;
@@ -319,7 +324,7 @@ impl<'a> EseDb<'a> {
             let (_hdr_size, num_tags) = self.page_tags(page);
 
             // Skip empty or space tree pages
-            if flags & 0x08 != 0 || flags & 0x20 != 0 {
+            if flags & PAGE_FLAG_SPACE_TREE != 0 || flags & PAGE_FLAG_INDEX != 0 {
                 continue;
             }
 
@@ -383,13 +388,13 @@ impl<'a> EseDb<'a> {
             let (flags, _) = self.page_header(page);
             let (_, num_tags) = self.page_tags(page);
 
-            if flags & 0x08 != 0 || flags & 0x20 != 0 {
+            if flags & PAGE_FLAG_SPACE_TREE != 0 || flags & PAGE_FLAG_INDEX != 0 {
                 continue;
             }
 
             if flags & PAGE_FLAG_LEAF != 0 {
                 // Get page key prefix from tag 0 (for key reconstruction)
-                let page_key_prefix = if flags & 0x01 == 0 {
+                let page_key_prefix = if flags & PAGE_FLAG_ROOT == 0 {
                     // Non-root page: tag 0 is the raw key prefix
                     self.tag_data(page, 0, flags).unwrap_or(&[])
                 } else {
@@ -450,42 +455,18 @@ impl<'a> EseDb<'a> {
 
         log::info!("ESE catalog: {} raw records", records.len());
 
-        // Parse catalog records
-        // Catalog record format (fixed columns):
-        //   +0x00: ObjidTable (u32) - fixed col 1
-        //   +0x04: Type (u16) - fixed col 2  (1=table, 2=column, 3=index, 4=LV)
-        //   +0x06: Id (u32) - fixed col 3
-        //   +0x0A: ColtypOrPgnoFDP (u32) - fixed col 4
-        //   +0x0E: SpaceUsage (u32) - fixed col 5
-        //   +0x12: Flags (u32) - fixed col 6
-        //   +0x16: PagesOrLocale (u32) - fixed col 7
-        //
-        // Then variable columns follow (name is variable col 128 = first variable)
-        // The record starts with a 4-byte header: last_fixed_type(u8) | last_fixed_id | last_var_id
-        // Wait, the record format is:
-        //   byte 0: last_fixed_column_id (tells how many fixed cols are present)
-        //   byte 1-2: variable data offset (last fixed data byte)
-        //   Then fixed column data
-        //   Then variable column offset array
-        //   Then variable column data
-        //   Then tagged columns
-
-        // Actually, the ESE record format is:
-        // Byte 0: lastFixedColumnId (u8 in old, but actually u16 for the full spec)
-        // ... Let me parse this properly.
-
-        // For catalog records, the fixed portion has a well-known layout:
+        // Catalog record layout (MSysObjects):
         //   Bytes 0-3:   preamble: lastFixedId(1) + lastVarId(1) + varDataOffset(2)
-        //   Bytes 4-7:   ObjidTable (u32)     - column id 1
-        //   Bytes 8-9:   Type (u16)           - column id 2
-        //   Bytes 10-13: Id (u32)             - column id 3
-        //   Bytes 14-17: ColtypOrPgnoFDP (u32) - column id 4
-        //   Bytes 18-21: SpaceUsage (u32)     - column id 5
-        //   Bytes 22-25: Flags (u32)          - column id 6
-        //   Bytes 26-29: PagesOrLocale (u32)  - column id 7
+        //   Bytes 4-7:   ObjidTable (u32)      - column 1
+        //   Bytes 8-9:   Type (u16)            - column 2 (1=table, 2=column, 3=index, 4=LV)
+        //   Bytes 10-13: Id (u32)              - column 3
+        //   Bytes 14-17: ColtypOrPgnoFDP (u32) - column 4
+        //   Bytes 18-21: SpaceUsage (u32)      - column 5
+        //   Bytes 22-25: Flags (u32)           - column 6
+        //   Bytes 26-29: PagesOrLocale (u32)   - column 7
         //
-        // After fixed cols: variable column offset table (2 bytes each)
-        // Variable col 128 = Name (first variable column)
+        //   After fixed cols: variable column offset table (2 bytes each)
+        //   Variable column 128 = Name (first variable column)
 
         let mut table_map: HashMap<u32, (String, u32)> = HashMap::new(); // obj_id -> (name, data_pgno)
         let mut lv_map: HashMap<u32, u32> = HashMap::new(); // obj_id -> lv_pgno
@@ -654,12 +635,7 @@ impl<'a> EseDb<'a> {
             s.trim_end_matches('\0').to_string()
         } else {
             // UTF-16LE fallback
-            let u16s: Vec<u16> = name_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .take_while(|&c| c != 0)
-                .collect();
-            String::from_utf16_lossy(&u16s)
+            crate::utils::utf16le_decode(name_bytes)
         }
     }
 
@@ -715,28 +691,6 @@ impl<'a> EseDb<'a> {
             };
 
             callback(&reader);
-        }
-
-        Ok(())
-    }
-
-    /// Iterate all rows in a table, exposing raw record bytes (for debugging).
-    pub fn for_each_row_raw<F>(&self, table: &str, mut callback: F) -> Result<()>
-    where
-        F: FnMut(&[u8]),
-    {
-        let tbl = self
-            .tables
-            .get(table)
-            .ok_or_else(|| ese_err(&format!("Table '{}' not found", table)))?;
-
-        let mut records: Vec<&'a [u8]> = Vec::new();
-        self.traverse_btree(tbl.data_pgno, |data| {
-            records.push(data);
-        })?;
-
-        for rec_data in &records {
-            callback(rec_data);
         }
 
         Ok(())
@@ -1018,14 +972,17 @@ impl<'a> EseDb<'a> {
 
         // LV B+ tree keys: LID(4 BE) + segment_offset(4 BE)
         self.traverse_btree_kv(lv_pgno, |key, data| {
-            if key.len() >= 4 {
-                let rec_lid = u32::from_be_bytes(key[..4].try_into().unwrap());
+            if let Some(rec_lid) = key
+                .get(..4)
+                .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                .map(u32::from_be_bytes)
+            {
                 if rec_lid == lid {
-                    let seg_offset = if key.len() >= 8 {
-                        u32::from_be_bytes(key[4..8].try_into().unwrap())
-                    } else {
-                        0
-                    };
+                    let seg_offset = key
+                        .get(4..8)
+                        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+                        .map(u32::from_be_bytes)
+                        .unwrap_or(0);
                     chunks.push((seg_offset, data.to_vec()));
                 }
             }
@@ -1046,14 +1003,20 @@ impl<'a> EseDb<'a> {
     }
 }
 
-fn ese_err(msg: &str) -> GovmemError {
-    GovmemError::DecryptionError(format!("ESE: {}", msg))
+fn ese_err(msg: &str) -> VmkatzError {
+    VmkatzError::DecryptionError(format!("ESE: {}", msg))
 }
 
 fn u16_le(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+    data.get(off..off + 2)
+        .and_then(|s| <[u8; 2]>::try_from(s).ok())
+        .map(u16::from_le_bytes)
+        .unwrap_or(0)
 }
 
 fn u32_le(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+    data.get(off..off + 4)
+        .and_then(|s| <[u8; 4]>::try_from(s).ok())
+        .map(u32::from_le_bytes)
+        .unwrap_or(0)
 }

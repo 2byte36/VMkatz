@@ -4,7 +4,7 @@
 //! (JD, Skew1, GBG, Data), concatenated and permuted.
 
 use super::hive::Hive;
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 /// Permutation table applied to the raw 16-byte key.
 const PBOX: [usize; 16] = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7];
@@ -93,14 +93,14 @@ pub fn extract_bootkey(system_hive_data: &[u8]) -> Result<[u8; 16]> {
     };
 
     if gap_pct > 10 {
-        Err(GovmemError::DecryptionError(format!(
+        Err(VmkatzError::DecryptionError(format!(
             "Bootkey extraction failed: SYSTEM hive has {}% zero-filled pages ({}/{}) — \
              bootkey registry cells (JD/Skew1/GBG/Data) are in missing disk extents",
             gap_pct, zero_pages, total_pages,
         )))
     } else {
         Err(last_err.unwrap_or_else(|| {
-            GovmemError::DecryptionError("No accessible ControlSet found in SYSTEM hive".into())
+            VmkatzError::DecryptionError("No accessible ControlSet found in SYSTEM hive".into())
         }))
     }
 }
@@ -114,13 +114,13 @@ fn extract_bootkey_from_lsa(hive: &Hive<'_>, lsa: &super::hive::Key<'_>) -> Resu
         let sub = lsa.subkey(hive, kn)?;
         let class = sub.class_name(hive)?;
         let bytes = hex::decode(&class).map_err(|e| {
-            GovmemError::DecryptionError(format!("Bad hex in {} class name '{}': {}", kn, class, e))
+            VmkatzError::DecryptionError(format!("Bad hex in {} class name '{}': {}", kn, class, e))
         })?;
         raw.extend_from_slice(&bytes);
     }
 
     if raw.len() != 16 {
-        return Err(GovmemError::DecryptionError(format!(
+        return Err(VmkatzError::DecryptionError(format!(
             "Bootkey raw length {} (expected 16)",
             raw.len()
         )));
@@ -161,7 +161,7 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
         if pos + 4 > hive_data.len() {
             break;
         }
-        let size_raw = i32::from_le_bytes(hive_data[pos..pos + 4].try_into().unwrap());
+        let size_raw = crate::utils::read_i32_le(hive_data, pos).unwrap_or(0);
         let cell_size = size_raw.unsigned_abs() as usize;
         if !(8..=0x100000).contains(&cell_size) || pos + cell_size > hive_data.len() {
             // Invalid cell — try next aligned position
@@ -173,18 +173,10 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
 
         // Check for NK signature
         if cell_data_off + 0x50 < hive_data.len() {
-            let sig = u16::from_le_bytes(
-                hive_data[cell_data_off..cell_data_off + 2]
-                    .try_into()
-                    .unwrap(),
-            );
+            let sig = crate::utils::read_u16_le(hive_data, cell_data_off).unwrap_or(0);
             if sig == 0x6B6E {
                 // "nk"
-                let name_len = u16::from_le_bytes(
-                    hive_data[cell_data_off + 0x48..cell_data_off + 0x4A]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
+                let name_len = crate::utils::read_u16_le(hive_data, cell_data_off + 0x48).unwrap_or(0) as usize;
 
                 if name_len > 0 && cell_data_off + 0x4C + name_len <= hive_data.len() {
                     let name = std::str::from_utf8(
@@ -195,16 +187,8 @@ fn scan_hive_for_bootkey_cells(hive_data: &[u8]) -> Option<[u8; 16]> {
                     for &(target, idx) in &targets {
                         if name.eq_ignore_ascii_case(target) && class_bytes[idx].is_none() {
                             // Read class name from this NK cell
-                            let class_offset = u32::from_le_bytes(
-                                hive_data[cell_data_off + 0x30..cell_data_off + 0x34]
-                                    .try_into()
-                                    .unwrap(),
-                            );
-                            let class_len = u16::from_le_bytes(
-                                hive_data[cell_data_off + 0x4A..cell_data_off + 0x4C]
-                                    .try_into()
-                                    .unwrap(),
-                            ) as usize;
+                            let class_offset = crate::utils::read_u32_le(hive_data, cell_data_off + 0x30).unwrap_or(0xFFFF_FFFF);
+                            let class_len = crate::utils::read_u16_le(hive_data, cell_data_off + 0x4A).unwrap_or(0) as usize;
 
                             if class_offset != 0xFFFF_FFFF && class_len > 0 {
                                 if let Some(bytes) =
@@ -282,7 +266,7 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
         // Scan cells within this hbin block (skip 0x20 hbin header)
         let mut pos = 0x20;
         while pos + 0x50 < block_data.len() {
-            let size_raw = i32::from_le_bytes(block_data[pos..pos + 4].try_into().unwrap());
+            let size_raw = crate::utils::read_i32_le(block_data, pos).unwrap_or(0);
             let cell_size = size_raw.unsigned_abs() as usize;
             if !(8..=0x100000).contains(&cell_size) || pos + cell_size > block_data.len() {
                 pos += 8;
@@ -291,11 +275,11 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
 
             let cd = pos + 4; // cell data offset (past size)
             if cd + 0x50 < block_data.len() {
-                let sig = u16::from_le_bytes(block_data[cd..cd + 2].try_into().unwrap());
+                let sig = crate::utils::read_u16_le(block_data, cd).unwrap_or(0);
                 if sig == 0x6B6E {
                     // "nk"
                     let name_len =
-                        u16::from_le_bytes(block_data[cd + 0x48..cd + 0x4A].try_into().unwrap())
+                        crate::utils::read_u16_le(block_data, cd + 0x48).unwrap_or(0)
                             as usize;
 
                     if name_len > 0 && cd + 0x4C + name_len <= block_data.len() {
@@ -305,12 +289,8 @@ pub fn scan_blocks_for_bootkey(blocks: &[(u32, Vec<u8>)]) -> Option<[u8; 16]> {
 
                         for &(target, idx) in &targets {
                             if name.eq_ignore_ascii_case(target) && class_bytes[idx].is_none() {
-                                let class_offset = u32::from_le_bytes(
-                                    block_data[cd + 0x30..cd + 0x34].try_into().unwrap(),
-                                );
-                                let class_len = u16::from_le_bytes(
-                                    block_data[cd + 0x4A..cd + 0x4C].try_into().unwrap(),
-                                ) as usize;
+                                let class_offset = crate::utils::read_u32_le(block_data, cd + 0x30).unwrap_or(0xFFFF_FFFF);
+                                let class_len = crate::utils::read_u16_le(block_data, cd + 0x4A).unwrap_or(0) as usize;
 
                                 if class_offset != 0xFFFF_FFFF && class_len > 0 {
                                     // Try to resolve class cell across all blocks
@@ -393,7 +373,7 @@ fn resolve_class_across_blocks(
             }
             // Read cell at this position
             let size_raw =
-                i32::from_le_bytes(block_data[local_off..local_off + 4].try_into().unwrap());
+                crate::utils::read_i32_le(block_data, local_off).unwrap_or(0);
             let abs_size = size_raw.unsigned_abs() as usize;
             if abs_size < 4 || local_off + abs_size > block_data.len() {
                 continue;
@@ -405,11 +385,7 @@ fn resolve_class_across_blocks(
 
             // UTF-16LE → string → hex decode
             let class_str = if class_len >= 2 && class_len.is_multiple_of(2) {
-                let u16s: Vec<u16> = cell_data[..class_len]
-                    .chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                    .collect();
-                String::from_utf16_lossy(&u16s)
+                crate::utils::utf16le_decode(&cell_data[..class_len])
             } else {
                 String::from_utf8_lossy(&cell_data[..class_len]).into_owned()
             };
@@ -428,7 +404,7 @@ fn read_class_hex(hive_data: &[u8], class_offset: u32, class_len: usize) -> Opti
         return None;
     }
     // Read cell size
-    let size_raw = i32::from_le_bytes(hive_data[file_off..file_off + 4].try_into().unwrap());
+    let size_raw = crate::utils::read_i32_le(hive_data, file_off).unwrap_or(0);
     let abs_size = size_raw.unsigned_abs() as usize;
     if abs_size < 4 || file_off + abs_size > hive_data.len() {
         return None;
@@ -440,11 +416,7 @@ fn read_class_hex(hive_data: &[u8], class_offset: u32, class_len: usize) -> Opti
 
     // Class name is UTF-16LE → decode to string → hex decode
     let class_str = if class_len >= 2 && class_len.is_multiple_of(2) {
-        let u16s: Vec<u16> = cell_data[..class_len]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        String::from_utf16_lossy(&u16s)
+        crate::utils::utf16le_decode(&cell_data[..class_len])
     } else {
         String::from_utf8_lossy(&cell_data[..class_len]).into_owned()
     };

@@ -2,7 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
+use super::{read_u16_be_file, read_u32_be_file, read_u64_be_file};
 
 /// VHD footer cookie: "conectix" (8 bytes).
 const VHD_COOKIE: [u8; 8] = *b"conectix";
@@ -35,24 +36,6 @@ pub struct VhdDisk {
     parent: Option<Box<VhdDisk>>,
 }
 
-fn read_u16_be(f: &mut File) -> std::io::Result<u16> {
-    let mut buf = [0u8; 2];
-    f.read_exact(&mut buf)?;
-    Ok(u16::from_be_bytes(buf))
-}
-
-fn read_u32_be(f: &mut File) -> std::io::Result<u32> {
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)?;
-    Ok(u32::from_be_bytes(buf))
-}
-
-fn read_u64_be(f: &mut File) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8];
-    f.read_exact(&mut buf)?;
-    Ok(u64::from_be_bytes(buf))
-}
-
 struct VhdFooter {
     data_offset: u64,
     current_size: u64,
@@ -79,7 +62,7 @@ fn parse_footer(file: &mut File) -> Result<VhdFooter> {
     // Footer is the last 512 bytes of the file
     let file_size = file.seek(SeekFrom::End(0))?;
     if file_size < 512 {
-        return Err(GovmemError::ProcessNotFound(
+        return Err(VmkatzError::DiskFormatError(
             "File too small for VHD".to_string(),
         ));
     }
@@ -88,21 +71,21 @@ fn parse_footer(file: &mut File) -> Result<VhdFooter> {
     let mut cookie = [0u8; 8];
     file.read_exact(&mut cookie)?;
     if cookie != VHD_COOKIE {
-        return Err(GovmemError::InvalidMagic(u32::from_be_bytes([
+        return Err(VmkatzError::InvalidMagic(u32::from_be_bytes([
             cookie[0], cookie[1], cookie[2], cookie[3],
         ])));
     }
 
-    let _features = read_u32_be(file)?;
-    let _format_version = read_u32_be(file)?;
-    let data_offset = read_u64_be(file)?;
-    let _timestamp = read_u32_be(file)?;
-    let _creator_app = read_u32_be(file)?;
-    let _creator_version = read_u32_be(file)?;
-    let _creator_host_os = read_u32_be(file)?;
-    let _original_size = read_u64_be(file)?;
-    let current_size = read_u64_be(file)?;
-    let _cylinders = read_u16_be(file)?;
+    let _features = read_u32_be_file(file)?;
+    let _format_version = read_u32_be_file(file)?;
+    let data_offset = read_u64_be_file(file)?;
+    let _timestamp = read_u32_be_file(file)?;
+    let _creator_app = read_u32_be_file(file)?;
+    let _creator_version = read_u32_be_file(file)?;
+    let _creator_host_os = read_u32_be_file(file)?;
+    let _original_size = read_u64_be_file(file)?;
+    let current_size = read_u64_be_file(file)?;
+    let _cylinders = read_u16_be_file(file)?;
     let _heads = {
         let mut b = [0u8; 1];
         file.read_exact(&mut b)?;
@@ -113,8 +96,8 @@ fn parse_footer(file: &mut File) -> Result<VhdFooter> {
         file.read_exact(&mut b)?;
         b[0]
     };
-    let disk_type = read_u32_be(file)?;
-    let _checksum = read_u32_be(file)?;
+    let disk_type = read_u32_be_file(file)?;
+    let _checksum = read_u32_be_file(file)?;
     let mut unique_id = [0u8; 16];
     file.read_exact(&mut unique_id)?;
 
@@ -132,24 +115,24 @@ fn parse_dynamic_header(file: &mut File, data_offset: u64) -> Result<VhdDynamicH
     let mut cookie = [0u8; 8];
     file.read_exact(&mut cookie)?;
     if cookie != CXSPARSE_COOKIE {
-        return Err(GovmemError::ProcessNotFound(format!(
+        return Err(VmkatzError::DiskFormatError(format!(
             "Invalid dynamic header cookie: {:?}",
             &cookie
         )));
     }
 
-    let _data_offset2 = read_u64_be(file)?; // reserved
-    let table_offset = read_u64_be(file)?;
-    let _header_version = read_u32_be(file)?;
-    let max_table_entries = read_u32_be(file)?;
-    let block_size = read_u32_be(file)?;
-    let _checksum = read_u32_be(file)?;
+    let _data_offset2 = read_u64_be_file(file)?; // reserved
+    let table_offset = read_u64_be_file(file)?;
+    let _header_version = read_u32_be_file(file)?;
+    let max_table_entries = read_u32_be_file(file)?;
+    let block_size = read_u32_be_file(file)?;
+    let _checksum = read_u32_be_file(file)?;
 
     let mut parent_unique_id = [0u8; 16];
     file.read_exact(&mut parent_unique_id)?;
 
-    let _parent_timestamp = read_u32_be(file)?;
-    let _reserved = read_u32_be(file)?;
+    let _parent_timestamp = read_u32_be_file(file)?;
+    let _reserved = read_u32_be_file(file)?;
 
     // Skip parent unicode name (512 bytes)
     file.seek(SeekFrom::Current(512))?;
@@ -157,11 +140,11 @@ fn parse_dynamic_header(file: &mut File, data_offset: u64) -> Result<VhdDynamicH
     // Read 8 parent locator entries (24 bytes each)
     let mut parent_locators = Vec::new();
     for _ in 0..8 {
-        let platform_code = read_u32_be(file)?;
-        let _platform_data_space = read_u32_be(file)?;
-        let platform_data_length = read_u32_be(file)?;
-        let _reserved = read_u32_be(file)?;
-        let platform_data_offset = read_u64_be(file)?;
+        let platform_code = read_u32_be_file(file)?;
+        let _platform_data_space = read_u32_be_file(file)?;
+        let platform_data_length = read_u32_be_file(file)?;
+        let _reserved = read_u32_be_file(file)?;
+        let platform_data_offset = read_u64_be_file(file)?;
 
         if platform_code != 0 && platform_data_length > 0 {
             parent_locators.push(ParentLocator {
@@ -195,13 +178,7 @@ fn read_parent_path(file: &mut File, locator: &ParentLocator) -> std::io::Result
         || code == 0x57327275
     // W2ru
     {
-        let u16s: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        Ok(String::from_utf16_lossy(&u16s)
-            .trim_end_matches('\0')
-            .to_string())
+        Ok(crate::utils::utf16le_decode(&data))
     } else if code == 0x4D616358 {
         // MacX: UTF-8 file URL
         Ok(String::from_utf8_lossy(&data)
@@ -289,7 +266,7 @@ impl VhdDisk {
         file.seek(SeekFrom::Start(dyn_header.table_offset))?;
         let mut bat = Vec::with_capacity(dyn_header.max_table_entries as usize);
         for _ in 0..dyn_header.max_table_entries {
-            bat.push(read_u32_be(&mut file)?);
+            bat.push(read_u32_be_file(&mut file)?);
         }
 
         // Open parent for differencing disks
@@ -502,23 +479,3 @@ impl super::DiskImage for VhdDisk {
     }
 }
 
-/// Quick check: does the file end with the VHD footer signature?
-pub fn is_vhd(path: &Path) -> bool {
-    let Ok(mut f) = File::open(path) else {
-        return false;
-    };
-    let Ok(file_size) = f.seek(SeekFrom::End(0)) else {
-        return false;
-    };
-    if file_size < 512 {
-        return false;
-    }
-    if f.seek(SeekFrom::Start(file_size - 512)).is_err() {
-        return false;
-    }
-    let mut cookie = [0u8; 8];
-    if f.read_exact(&mut cookie).is_err() {
-        return false;
-    }
-    cookie == VHD_COOKIE
-}

@@ -11,7 +11,7 @@ use sha2::Digest;
 
 use super::hashes::{decode_utf16le, md5_hash, rc4};
 use super::hive::Hive;
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 /// A single LSA secret with its name, raw data, and parsed interpretation.
 #[derive(Debug)]
@@ -28,6 +28,16 @@ pub enum LsaSecretType {
     DpapiSystem {
         user_key: [u8; 20],
         machine_key: [u8; 20],
+    },
+    /// DPAPI domain backup key — preferred key GUID pointer.
+    DpapiBackupPreferred { guid: String },
+    /// DPAPI domain backup key — RSA private key (can decrypt any domain user's master key).
+    DpapiBackupKey {
+        guid: String,
+        version: u32,
+        key_data: Vec<u8>,
+        cert_data: Vec<u8>,
+        pvk: Vec<u8>,
     },
     /// Machine account password (hex-encoded raw bytes).
     MachineAccount { password_hex: String },
@@ -53,6 +63,22 @@ impl std::fmt::Display for LsaSecret {
                     "  DPAPI_SYSTEM\n    user_key:    {}\n    machine_key: {}",
                     hex::encode(user_key),
                     hex::encode(machine_key)
+                )
+            }
+            LsaSecretType::DpapiBackupPreferred { guid } => {
+                write!(f, "  BCKUPKEY_P (Preferred Backup Key)\n    GUID: {}", guid)
+            }
+            LsaSecretType::DpapiBackupKey {
+                guid,
+                version,
+                key_data,
+                cert_data,
+                pvk,
+            } => {
+                write!(
+                    f,
+                    "  BCKUPKEY (Domain DPAPI Backup Key)\n    GUID    : {}\n    Version : {}\n    Key     : {} bytes\n    Cert    : {} bytes\n    PVK     : {} bytes",
+                    guid, version, key_data.len(), cert_data.len(), pvk.len()
                 )
             }
             LsaSecretType::MachineAccount { password_hex } => {
@@ -94,7 +120,7 @@ pub fn extract_lsa_secrets(security_data: &[u8], bootkey: &[u8; 16]) -> Result<V
             match rev_key.value(&hive, "") {
                 Ok(data) if data.len() >= 4 => {
                     // Default (unnamed) value: first DWORD is minor, second is major
-                    let val = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    let val = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
                     log::info!("SECURITY Policy revision: 0x{:08x}", val);
                     val
                 }
@@ -234,7 +260,7 @@ fn extract_lsa_key_modern(
     if decrypted.len() < 16 {
         return Err(lsa_err("PolEKList decrypted blob too short"));
     }
-    let blob_len = u32::from_le_bytes(decrypted[0..4].try_into().unwrap()) as usize;
+    let blob_len = crate::utils::read_u32_le(&decrypted, 0).unwrap_or(0) as usize;
     log::debug!(
         "PolEKList decrypted ({} bytes, blob_len={}): {}",
         decrypted.len(),
@@ -249,11 +275,7 @@ fn extract_lsa_key_modern(
     let keys_header = 16 + 28; // NT6_SYSTEM_KEYS header ends at 44
     let key_data_offset = keys_header + 16 + 4 + 4; // skip KeyId + KeyType + KeySize = 68
     if decrypted.len() >= key_data_offset + 32 {
-        let key_size = u32::from_le_bytes(
-            decrypted[keys_header + 20..keys_header + 24]
-                .try_into()
-                .unwrap(),
-        ) as usize;
+        let key_size = crate::utils::read_u32_le(&decrypted, keys_header + 20).unwrap_or(0) as usize;
         if key_size == 32 && decrypted.len() >= key_data_offset + 32 {
             let mut key = [0u8; 32];
             key.copy_from_slice(&decrypted[key_data_offset..key_data_offset + 32]);
@@ -333,7 +355,7 @@ fn decrypt_secret_modern(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>
         return Ok(Vec::new());
     }
 
-    let secret_len = u32::from_le_bytes(decrypted[0..4].try_into().unwrap()) as usize;
+    let secret_len = crate::utils::read_u32_le(&decrypted, 0).unwrap_or(0) as usize;
     if secret_len == 0 {
         return Ok(Vec::new());
     }
@@ -355,7 +377,7 @@ fn decrypt_secret_legacy(encrypted: &[u8], lsa_key: &[u8; 32]) -> Result<Vec<u8>
         return Err(lsa_err("Secret value too short for legacy decryption"));
     }
 
-    let secret_len = u32::from_le_bytes(encrypted[0..4].try_into().unwrap()) as usize;
+    let secret_len = crate::utils::read_u32_le(encrypted, 0).unwrap_or(0) as usize;
     let cipher_data = &encrypted[12..]; // Skip length(4) + unk(4) + unk(4)
 
     // Derive RC4 key: MD5(lsa_key[0..16] + secret_len_le_bytes * padding)
@@ -431,6 +453,27 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
         log::warn!("DPAPI_SYSTEM: expected 44 bytes, got {}", data.len());
     }
 
+    // DPAPI domain backup keys: BCKUPKEY_P (preferred GUID) and BCKUPKEY_{GUID} (RSA key)
+    if name.eq_ignore_ascii_case("BCKUPKEY_P") || name.eq_ignore_ascii_case("BCKUPKEY_PREFERRED") {
+        // 24 bytes: version(4) + reserved(4) + GUID(16)
+        if data.len() >= 24 {
+            let guid = format_guid(&data[8..24]);
+            return LsaSecretType::DpapiBackupPreferred { guid };
+        }
+        // Some versions store just the GUID (16 bytes)
+        if data.len() >= 16 {
+            let guid = format_guid(&data[..16]);
+            return LsaSecretType::DpapiBackupPreferred { guid };
+        }
+    }
+
+    if let Some(key_guid) = name.strip_prefix("BCKUPKEY_") {
+        // Skip if it's the "P" or "PREFERRED" variant (already handled above)
+        if !key_guid.eq_ignore_ascii_case("P") && !key_guid.eq_ignore_ascii_case("PREFERRED") {
+            return parse_bckupkey(key_guid, data);
+        }
+    }
+
     if name.eq_ignore_ascii_case("$MACHINE.ACC") {
         return LsaSecretType::MachineAccount {
             password_hex: hex::encode(data),
@@ -464,6 +507,102 @@ fn parse_secret(name: &str, data: &[u8]) -> LsaSecretType {
     LsaSecretType::Raw
 }
 
-fn lsa_err(msg: &str) -> GovmemError {
-    GovmemError::DecryptionError(format!("LSA: {}", msg))
+/// Format a 16-byte GUID as a standard string representation.
+fn format_guid(data: &[u8]) -> String {
+    if data.len() < 16 {
+        return hex::encode(data);
+    }
+    // GUID binary layout: Data1(4 LE) + Data2(2 LE) + Data3(2 LE) + Data4(8 BE)
+    let d1 = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+    let d2 = u16::from_le_bytes([data[4], data[5]]);
+    let d3 = u16::from_le_bytes([data[6], data[7]]);
+    format!(
+        "{{{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}}}",
+        d1, d2, d3, data[8], data[9], data[10], data[11], data[12], data[13], data[14], data[15]
+    )
+}
+
+/// Parse a BCKUPKEY_{GUID} backup key secret.
+///
+/// Structure (version 2):
+///   version(4) + key_length(4) + cert_length(4) + key_data(key_length) + cert_data(cert_length)
+///
+/// For version 1: raw PRIVATEKEYBLOB follows after version(4).
+fn parse_bckupkey(guid_str: &str, data: &[u8]) -> LsaSecretType {
+    if data.len() < 12 {
+        return LsaSecretType::Raw;
+    }
+
+    let version = crate::utils::read_u32_le(data, 0).unwrap_or(0);
+
+    match version {
+        2 => {
+            let key_len = crate::utils::read_u32_le(data, 4).unwrap_or(0) as usize;
+            let cert_len = crate::utils::read_u32_le(data, 8).unwrap_or(0) as usize;
+
+            if data.len() < 12 + key_len {
+                return LsaSecretType::Raw;
+            }
+
+            let key_data = data[12..12 + key_len].to_vec();
+            let cert_start = 12 + key_len;
+            let cert_data = if cert_len > 0 && data.len() >= cert_start + cert_len {
+                data[cert_start..cert_start + cert_len].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            // Build PVK format: magic(4) + reserved(4) + keytype(4) + encrypted(4) +
+            //                    cbEncryptData(4) + cbPvk(4) + pvk_data
+            let pvk = build_pvk(&key_data);
+
+            LsaSecretType::DpapiBackupKey {
+                guid: guid_str.to_string(),
+                version,
+                key_data,
+                cert_data,
+                pvk,
+            }
+        }
+        1 => {
+            // Version 1: entire blob after version is the key material
+            let key_data = data[4..].to_vec();
+            let pvk = build_pvk(&key_data);
+
+            LsaSecretType::DpapiBackupKey {
+                guid: guid_str.to_string(),
+                version,
+                key_data,
+                cert_data: Vec::new(),
+                pvk,
+            }
+        }
+        _ => LsaSecretType::Raw,
+    }
+}
+
+/// Build a PVK (Private Key) file from raw RSA key data.
+///
+/// PVK format (Microsoft):
+///   magic: 0xB0B5F11E (4 bytes LE)
+///   reserved: 0 (4 bytes)
+///   keytype: AT_KEYEXCHANGE=1 (4 bytes LE)
+///   encrypted: 0 (4 bytes, not encrypted)
+///   cbEncryptData: 0 (4 bytes)
+///   cbPvk: key_data.len() (4 bytes LE)
+///   pvk_data: raw key bytes
+fn build_pvk(key_data: &[u8]) -> Vec<u8> {
+    let mut pvk = Vec::with_capacity(24 + key_data.len());
+    pvk.extend_from_slice(&0xB0B5_F11Eu32.to_le_bytes()); // magic
+    pvk.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    pvk.extend_from_slice(&1u32.to_le_bytes()); // AT_KEYEXCHANGE
+    pvk.extend_from_slice(&0u32.to_le_bytes()); // not encrypted
+    pvk.extend_from_slice(&0u32.to_le_bytes()); // cbEncryptData
+    pvk.extend_from_slice(&(key_data.len() as u32).to_le_bytes()); // cbPvk
+    pvk.extend_from_slice(key_data);
+    pvk
+}
+
+fn lsa_err(msg: &str) -> VmkatzError {
+    VmkatzError::DecryptionError(format!("LSA: {}", msg))
 }

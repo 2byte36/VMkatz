@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
 
 const PAGE_SIZE: usize = 4096;
@@ -329,7 +329,7 @@ impl VBoxLayer {
 
         let magic = &header[0..32];
         if !magic.starts_with(b"\x7fVirtualBox SavedState V2.0\n") {
-            return Err(GovmemError::Io(io::Error::new(
+            return Err(VmkatzError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Not a VirtualBox .sav file (bad magic)",
             )));
@@ -499,7 +499,7 @@ impl VBoxLayer {
                     zero_count += 1;
                 }
                 _ => {
-                    return Err(GovmemError::Io(io::Error::new(
+                    return Err(VmkatzError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("Unknown PGM page type: 0x{:02x}", base_type),
                     )));
@@ -553,7 +553,7 @@ impl VBoxLayer {
 
         loop {
             if file_pos >= file_size {
-                return Err(GovmemError::Io(io::Error::new(
+                return Err(VmkatzError::Io(io::Error::new(
                     io::ErrorKind::NotFound,
                     "PGM unit not found in .sav file",
                 )));
@@ -613,20 +613,10 @@ impl VBoxLayer {
             reader.seek(SeekFrom::Start(file_pos))?;
         }
 
-        Err(GovmemError::Io(io::Error::new(
+        Err(VmkatzError::Io(io::Error::new(
             io::ErrorKind::NotFound,
             "PGM unit not found in .sav file",
         )))
-    }
-
-    /// Get a reference to the raw page data for direct scanning (physical scan fallback).
-    pub fn raw_pages(&self) -> &[u8] {
-        &self.page_data
-    }
-
-    /// Total physical address space size.
-    pub fn ram_size(&self) -> u64 {
-        self.phys_end
     }
 
     /// Number of mapped RAM pages.
@@ -657,13 +647,13 @@ impl PhysicalMemory for VBoxLayer {
                     let data_start = idx as usize * PAGE_SIZE + cur_offset;
                     let data_end = data_start + to_copy;
                     if data_end > self.page_data.len() {
-                        return Err(GovmemError::UnmappablePhysical(cur_addr));
+                        return Err(VmkatzError::UnmappablePhysical(cur_addr));
                     }
                     buf[buf_pos..buf_pos + to_copy]
                         .copy_from_slice(&self.page_data[data_start..data_end]);
                 }
                 None => {
-                    return Err(GovmemError::UnmappablePhysical(cur_addr));
+                    return Err(VmkatzError::UnmappablePhysical(cur_addr));
                 }
             }
 

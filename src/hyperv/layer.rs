@@ -13,7 +13,7 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use crate::memory::PhysicalMemory;
 
 /// Hyper-V memory layer: provides physical memory from .bin or raw dump files.
@@ -33,7 +33,7 @@ impl HypervLayer {
         let size = mmap.len() as u64;
 
         if size == 0 {
-            return Err(GovmemError::Io(std::io::Error::new(
+            return Err(VmkatzError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "Empty memory dump file",
             )));

@@ -6,7 +6,7 @@
 
 use super::hashes::{aes128_cbc_decrypt, decode_utf16le};
 use super::hive::Hive;
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 /// A single domain cached credential entry.
 #[derive(Debug)]
@@ -45,7 +45,7 @@ pub fn extract_cached_credentials(
     nlkm_key: &[u8],
 ) -> Result<Vec<CachedCredential>> {
     if nlkm_key.len() < 32 {
-        return Err(GovmemError::DecryptionError(
+        return Err(VmkatzError::DecryptionError(
             "NL$KM key too short (need at least 32 bytes)".to_string(),
         ));
     }
@@ -67,7 +67,7 @@ pub fn extract_cached_credentials(
         Ok(iter_key) => {
             match iter_key.value(&hive, "") {
                 Ok(data) if data.len() >= 4 => {
-                    let raw = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    let raw = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
                     if raw > 10240 {
                         raw & 0xFFFF_FC00 // round down to nearest 1024
                     } else {
@@ -81,7 +81,7 @@ pub fn extract_cached_credentials(
             // NL$IterationCount might be a value, not a subkey
             match cache_key.value(&hive, "NL$IterationCount") {
                 Ok(data) if data.len() >= 4 => {
-                    let raw = u32::from_le_bytes(data[0..4].try_into().unwrap());
+                    let raw = crate::utils::read_u32_le(&data, 0).unwrap_or(0);
                     if raw > 10240 {
                         raw & 0xFFFF_FC00
                     } else {
@@ -100,7 +100,7 @@ pub fn extract_cached_credentials(
     // LSA_SECRET_BLOB header), which is equivalent to [0:16] on the stripped secret.
     let aes_key = &nlkm_key[..16];
 
-    let mut credentials = Vec::new();
+    let mut credentials = Vec::with_capacity(10);
 
     // Try NL$1 through NL$50 (max configurable cache size)
     for i in 1..=50 {
@@ -117,9 +117,9 @@ pub fn extract_cached_credentials(
         }
 
         // Parse NL_RECORD header
-        let user_length = u16::from_le_bytes(data[0x00..0x02].try_into().unwrap()) as usize;
-        let domain_name_length = u16::from_le_bytes(data[0x02..0x04].try_into().unwrap()) as usize;
-        let dns_domain_length = u16::from_le_bytes(data[0x3C..0x3E].try_into().unwrap()) as usize;
+        let user_length = crate::utils::read_u16_le(&data, 0x00).unwrap_or(0) as usize;
+        let domain_name_length = crate::utils::read_u16_le(&data, 0x02).unwrap_or(0) as usize;
+        let dns_domain_length = crate::utils::read_u16_le(&data, 0x3C).unwrap_or(0) as usize;
 
         // IV at offset 0x40 (16 bytes)
         let iv = &data[0x40..0x50];
@@ -130,7 +130,7 @@ pub fn extract_cached_credentials(
         }
 
         // Flags at 0x30
-        let flags = u32::from_le_bytes(data[0x30..0x34].try_into().unwrap());
+        let flags = crate::utils::read_u32_le(&data, 0x30).unwrap_or(0);
         if flags & 1 != 1 {
             continue; // not a valid/encrypted entry
         }

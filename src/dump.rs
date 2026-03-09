@@ -7,10 +7,10 @@ use std::collections::BTreeSet;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 use crate::lsass::finder::{DiskPathRef, PagefileRef};
 use crate::memory::{PhysicalMemory, VirtualMemory};
-use crate::paging::entry::PageTableEntry;
+use crate::paging::entry::{PageTableEntry, PAGE_PHYS_MASK};
 use crate::paging::translate::ProcessMemory;
 use crate::windows::offsets::X64_LDR;
 use crate::windows::peb::{self, LoadedModule};
@@ -134,7 +134,7 @@ pub fn dump_process<P: PhysicalMemory>(
 /// Walk page tables collecting all user-mode VAs with valid PTEs.
 /// Includes present, transition, and pagefile PTEs (not just present+transition).
 fn collect_all_user_pages<P: PhysicalMemory>(phys: &P, cr3: u64, pages: &mut BTreeSet<u64>) {
-    let pml4_base = cr3 & 0x000F_FFFF_FFFF_F000;
+    let pml4_base = cr3 & PAGE_PHYS_MASK;
 
     for pml4_idx in 0..256u64 {
         let pml4e = match phys.read_phys_u64(pml4_base + pml4_idx * 8) {
@@ -230,12 +230,12 @@ fn coalesce_pages(sorted_vas: &[u64]) -> Vec<MemoryRegion> {
 /// Write the minidump file with 3 streams.
 fn write_minidump(
     output_path: &Path,
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     modules: &[LoadedModule],
     regions: &[MemoryRegion],
     build_number: u32,
 ) -> Result<()> {
-    let file = std::fs::File::create(output_path).map_err(GovmemError::Io)?;
+    let file = std::fs::File::create(output_path).map_err(VmkatzError::Io)?;
     let mut w = BufWriter::new(file);
 
     // === Layout computation ===

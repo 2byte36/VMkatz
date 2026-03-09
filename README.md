@@ -28,7 +28,7 @@ All 9 SSP credential providers that mimikatz implements:
 | --- | --- | --- |
 | MSV1_0 | NT/LM hashes, SHA1 | Physical-scan fallback for paged entries |
 | WDigest | Plaintext passwords | Linked-list walk + `.data` fallback |
-| Kerberos | Passwords, tickets (`.kirbi`) | AVL tree walk, often paged in VM snapshots |
+| Kerberos | AES/RC4/DES keys, tickets (`.kirbi`/`.ccache`) | AVL tree walk, often paged in VM snapshots |
 | TsPkg | Plaintext passwords | RDP sessions only |
 | DPAPI | Master key cache (GUID + decrypted key) | SHA1 masterkey for offline DPAPI decrypt |
 | SSP | Plaintext credentials | `SspCredentialList` in `msv1_0.dll` |
@@ -44,23 +44,23 @@ All 9 SSP credential providers that mimikatz implements:
 
 ## Supported Inputs
 
-| Format | Extensions | Source |
-| --- | --- | --- |
-| VMware snapshots | `.vmsn` + `.vmem` | Workstation, ESXi |
-| VirtualBox saved states | `.sav` | VirtualBox |
-| QEMU/KVM ELF core dumps | `.elf` | `virsh dump`, `dump-guest-memory` |
-| Hyper-V memory dumps | `.bin`, `.raw`, `.dmp` | Legacy saved states, raw dumps |
-| VMware virtual disks | `.vmdk` (sparse + flat) | Workstation, ESXi |
-| VirtualBox virtual disks | `.vdi` | VirtualBox |
-| QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox |
-| Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V |
-| LVM block devices | `/dev/...` | Proxmox LVM-thin, raw LVs |
-| Raw registry hives | `SAM`, `SYSTEM`, `SECURITY` | Exported from disk or `reg save` |
-| Raw NTDS.dit | `ntds.dit` + `SYSTEM` | Copied from domain controller |
-| LSASS minidump | `.dmp` | `--dump lsass`, procdump, Task Manager |
-| VM directories | any folder | Auto-discovers all processable files |
+| Format | Extensions | Source | Status |
+| --- | --- | --- | --- |
+| VMware snapshots | `.vmsn` + `.vmem` | Workstation, ESXi | Tested |
+| VirtualBox saved states | `.sav` | VirtualBox | Tested |
+| QEMU/KVM ELF core dumps | `.elf` | `virsh dump`, `dump-guest-memory` | Untested |
+| Hyper-V memory dumps | `.bin`, `.raw` | Legacy saved states, raw dumps | Untested, legacy only (no `.vmrs`) |
+| VMware virtual disks | `.vmdk` (sparse + flat) | Workstation, ESXi | Tested |
+| VirtualBox virtual disks | `.vdi` | VirtualBox | Tested |
+| QEMU/KVM virtual disks | `.qcow2` | QEMU, Proxmox | Tested |
+| Hyper-V virtual disks | `.vhdx`, `.vhd` | Hyper-V | Untested |
+| LVM block devices | `/dev/...` | Proxmox LVM-thin, raw LVs | Tested |
+| Raw registry hives | `SAM`, `SYSTEM`, `SECURITY` | Exported from disk or `reg save` | Tested |
+| Raw NTDS.dit | `ntds.dit` + `SYSTEM` | Copied from domain controller | Tested |
+| LSASS minidump | `.dmp` | `--dump lsass`, procdump, Task Manager | Tested |
+| VM directories | any folder | Auto-discovers all processable files | Tested |
 
-**Target OS**: Windows 7 SP1 through Windows Server 2025 x64 (auto-detected).
+**Target OS**: Windows XP SP3 through Windows Server 2025 (x86 PAE + x64, auto-detected).
 
 ## Quick Start
 
@@ -104,6 +104,19 @@ cargo build --release
 
 # Output as NTLM pwdump format
 ./vmkatz --format ntlm snapshot.vmsn
+
+# Export Kerberos tickets
+./vmkatz --kirbi snapshot.vmsn        # export as .kirbi files
+./vmkatz --ccache snapshot.vmsn       # export as .ccache file
+
+# Parse LSASS minidump
+./vmkatz lsass.dmp
+
+# Degraded extraction from truncated/partial memory
+./vmkatz --carve partial-snapshot.vmsn
+
+# Show all sessions including empty ones
+./vmkatz --all snapshot.vmsn
 ```
 
 ## Output Formats
@@ -221,16 +234,75 @@ VMkatz is modular. Features can be enabled/disabled at compile time:
 | `hyperv` | Hyper-V `.bin`/`.raw` dump support | Yes |
 | `sam` | Disk extraction (SAM/LSA/DCC2) and disk format handlers | Yes |
 | `ntds.dit` | NTDS.dit AD extraction (`--ntds`, `--ntds-history`). Requires `sam` | Yes |
+| `carve` | Degraded extraction from partial/truncated memory (`--carve`) | Yes |
+| `dump` | Process memory dump as minidump (`--dump`) | Yes |
 
 ```bash
-# Default build (all hypervisors + disk + NTDS)
+# Full build with everything (default)
 cargo build --release
 
-# Memory-only build (no disk handling, smaller binary)
+# Minimal VMware-only build (no carve, no dump, no disk)
+cargo build --release --no-default-features --features vmware
+
+# Memory extraction only (all hypervisors, no disk/carve/dump)
 cargo build --release --no-default-features --features "vmware vbox qemu hyperv"
 
 # Disk-only build (SAM + NTDS, no memory snapshot support)
 cargo build --release --no-default-features --features "sam ntds.dit"
+
+# Memory + carve (no dump, no disk)
+cargo build --release --no-default-features --features "vmware vbox qemu hyperv carve"
+```
+
+## Module Architecture
+
+```
+src/
+├── main.rs              CLI dispatch, format detection, output formatting
+├── lib.rs               Crate root — feature-gated module declarations
+├── error.rs             VmkatzError type (thiserror + anyhow)
+├── memory/
+│   └── reader.rs        PhysicalMemory and VirtualMemory traits
+├── pe.rs                PE header parser (exports, sections, data directories)
+├── minidump.rs          MDMP parser — VirtualMemory trait over minidump regions
+├── discover.rs          Directory/recursive auto-discovery of VM files
+├── paging/
+│   ├── mod.rs           4-level x64 page table walker (CR3 → PTE)
+│   ├── pae.rs           3-level PAE page table walker (pre-Vista x86)
+│   ├── ept.rs           Extended Page Table scanner (VBS/nested Hyper-V)
+│   └── pagefile.rs      Pagefile.sys fault resolution from disk
+├── windows/
+│   ├── process.rs       EPROCESS discovery (System process, process enumeration)
+│   └── offsets.rs       EPROCESS offset tables (Win7 → Win11 24H2, x64 + x86 PAE)
+├── lsass/
+│   ├── finder.rs        Main extraction orchestrator (PhysicalMemory + minidump paths)
+│   ├── crypto.rs        LSASS decryption (AES-CBC, 3DES-CBC, DES-X-CBC, RC4)
+│   ├── patterns.rs      Signature patterns for crypto key discovery in DLL sections
+│   ├── types.rs         Credential, LogonSession, DpapiCredential structs
+│   ├── msv.rs           MSV1_0 provider (NT/LM/SHA1 hashes)
+│   ├── wdigest.rs       WDigest provider (plaintext passwords)
+│   ├── kerberos.rs      Kerberos provider (tickets, passwords)
+│   ├── tspkg.rs         TsPkg provider (RDP plaintext)
+│   ├── dpapi.rs         DPAPI provider (master key cache)
+│   ├── ssp.rs           SSP provider (plaintext credentials)
+│   ├── livessp.rs       LiveSSP provider (plaintext, rare post-Win8)
+│   ├── credman.rs       Credential Manager (stored credentials)
+│   ├── cloudap.rs       CloudAP provider (Azure AD tokens)
+│   └── carve.rs         [feature: carve] Degraded extraction for partial memory
+├── dump.rs              [feature: dump] Process memory → minidump writer
+├── vmware/              [feature: vmware] VMware .vmsn/.vmem/.vmss layer
+├── vbox/                [feature: vbox] VirtualBox .sav layer
+├── qemu/                [feature: qemu] QEMU ELF core dump layer
+├── hyperv/              [feature: hyperv] Hyper-V .bin/.raw layer
+├── sam/                 [feature: sam] SAM/LSA/DCC2 + disk format handlers
+│   ├── mod.rs           Orchestration, types, bootkey extraction
+│   ├── partition.rs     MBR/GPT partition table parser
+│   ├── ntfs_reader.rs   NTFS MFT walker (SAM/SYSTEM/SECURITY hive discovery)
+│   ├── disk_fallbacks.rs Fallback hive search for non-standard layouts
+│   └── vmdk_scan.rs     Sparse VMDK descriptor + extent parser
+└── ntds/                [feature: ntds.dit] NTDS.dit ESE database parser
+    ├── mod.rs           ESE page/B+ tree traversal, PEK decryption, hash extraction
+    └── ese.rs           JET Blue database primitives (pages, tags, columns)
 ```
 
 ## Tested Targets
@@ -264,17 +336,18 @@ Tested across 7 Windows versions and 4 hypervisors.
 ### Known limitations
 - **VBS / Credential Guard**: VMs with Virtualization-Based Security enabled use nested Hyper-V page tables. The VMEM captured by ESXi is 99% zero pages because the actual kernel memory is behind Hyper-V's SLAT. An EPT walker is implemented but cannot yet recover credentials from these VMs. SAM extraction from the virtual disk still works when the VM is powered off.
 - **Kerberos**: Kerberos credentials are frequently paged out in VM snapshots. The provider reports `paged` but the data is legitimately absent from RAM. Pagefile resolution (`--disk`) can recover some entries.
-- **x86 (32-bit) guests**: Not supported. Only x64 Windows is targeted.
+- **Hyper-V**: Only legacy memory dumps (`.bin`, `.raw`) are supported via identity-mapped reading. Modern Hyper-V 2016+ saved states (`.vmrs`) use a proprietary undocumented format requiring Microsoft's `vmsavedstatedumpprovider.dll` and are not supported. VHDX/VHD disk extraction is implemented but untested. QEMU/KVM ELF core dumps are implemented but also untested.
+- **x86 (32-bit) guests**: Partial support — WinXP SP3 and Win2003 SP2 (x86 PAE) are supported for LSASS extraction. Later 32-bit versions (Vista/Win7 x86) are not yet supported.
 
 ## How It Works
 
 1. **Layer**: Opens the VM snapshot format and exposes guest physical memory as a flat address space. Each hypervisor format (VMware regions, VBox page map, QEMU ELF segments, Hyper-V identity map) is abstracted behind a common `PhysicalMemory` trait.
 
-2. **Process discovery**: Scans physical memory for EPROCESS structures using signature matching (`System\0` at ImageFileName offset) with auto-detection across 6 known offset tables (Win7 through Win11 24H2).
+2. **Process discovery**: Scans physical memory for EPROCESS structures using signature matching (`System\0` at ImageFileName offset) with auto-detection across 13 known offset tables (WinXP SP3 through Win11 24H2, x86 PAE + x64).
 
-3. **Page table walking**: Translates virtual addresses to physical using the kernel DTB (CR3) with full 4-level page table support. Handles large pages (2MB/1GB), PCID bits, and pagefile fault resolution.
+3. **Page table walking**: Translates virtual addresses to physical using the kernel DTB (CR3). Supports 4-level x64 page tables and 3-level PAE (pre-Vista x86). TLB cache (256-entry direct-mapped), large pages (2MB/1GB), PCID bits, and pagefile fault resolution.
 
-4. **LSASS extraction**: Locates `lsass.exe`, maps its virtual address space, finds DLLs (`lsass.dll`, `msv1_0.dll`, `wdigest.dll`, `kerberos.dll`, etc.) via PEB/LDR enumeration, resolves crypto keys via pattern matching on `.text`/`.data` sections, and decrypts credentials in-memory using 3DES-CBC or AES-CBC (auto-detected by buffer alignment).
+4. **LSASS extraction**: Locates `lsass.exe`, maps its virtual address space, finds DLLs (`lsasrv.dll`, `msv1_0.dll`, `wdigest.dll`, `kerberos.dll`, `dpapisrv.dll`, etc.) via PEB/LDR enumeration, resolves crypto keys via pattern matching on `.text`/`.data` sections, and decrypts credentials in-memory using 3DES-CBC, AES-CBC, AES-CFB, DES-X-CBC, or RC4 (auto-detected by buffer alignment and OS version). Also works on LSASS minidumps (`.dmp`).
 
 5. **Disk extraction**: Parses the virtual disk container (sparse VMDK, VDI, QCOW2, VHDX, VHD), finds the Windows partition (MBR/GPT), walks NTFS MFT to locate `SAM`, `SYSTEM`, `SECURITY` hives, and decrypts hashes using the boot key.
 
@@ -285,3 +358,4 @@ Tested across 7 Windows versions and 4 hypervisors.
 - [**mimikatz**](https://github.com/gentilkiwi/mimikatz) by Benjamin Delpy ([@gentilkiwi](https://twitter.com/gentilkiwi)) -- the definitive reference for LSASS internals and Windows credential decryption.
 - [**pypykatz**](https://github.com/skelsec/pypykatz) by Tamás Jós ([@skelsec](https://twitter.com/skelsec)) -- pure Python mimikatz reimplementation, used as cross-reference for SAM/LSA/DCC2 extraction.
 - [**Impacket**](https://github.com/fortra/impacket) by Fortra (originally Alberto Solino [@agsolino](https://twitter.com/agsolino)) -- reference implementation for NTDS.dit extraction and the pwdump output format.
+- [**Vergilius Project**](https://www.vergiliusproject.com/) -- documented Windows kernel structures used to verify EPROCESS field offsets across all supported builds (XP through Win11 24H2).

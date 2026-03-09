@@ -3,9 +3,26 @@
 //! Parses regf hive files to navigate keys, read values, and extract
 //! class names needed for bootkey/SAM hash extraction.
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 const HBIN_BASE: usize = 0x1000;
+
+// NK cell field offsets (relative to cell data start, after "nk" signature).
+// See https://github.com/msuhanov/regf/blob/master/Windows%20registry%20file%20format%20specification.md
+const NK_OFF_SUBKEY_COUNT: usize = 0x14;   // Number of stable subkeys (u32)
+const NK_OFF_SUBKEYS_LIST: usize = 0x1C;   // Offset to stable subkeys list (u32)
+const NK_OFF_VALUE_COUNT: usize = 0x24;    // Number of values (u32)
+const NK_OFF_VALUES_LIST: usize = 0x28;    // Offset to values list (u32)
+const NK_OFF_CLASS_OFFSET: usize = 0x30;   // Offset to class name (u32)
+const NK_OFF_NAME_LEN: usize = 0x48;       // Name length (u16)
+const NK_OFF_CLASS_LEN: usize = 0x4A;      // Class name length (u16)
+const NK_OFF_NAME: usize = 0x4C;           // Name string (variable length)
+
+// VK cell field offsets (relative to cell data start, after "vk" signature).
+const VK_OFF_NAME_LEN: usize = 0x02;      // Name length (u16)
+const VK_OFF_DATA_SIZE: usize = 0x04;     // Data size (u32, high bit = inline flag)
+const VK_OFF_DATA_OFFSET: usize = 0x08;   // Data offset or inline data (u32)
+const VK_OFF_NAME: usize = 0x14;          // Name string (variable length)
 
 /// A parsed registry hive backed by a byte slice.
 pub struct Hive<'a> {
@@ -69,7 +86,7 @@ impl<'a> Hive<'a> {
         if file_off + 4 > self.data.len() {
             return Err(hive_err("Cell offset out of bounds"));
         }
-        let size = i32::from_le_bytes(self.data[file_off..file_off + 4].try_into().unwrap());
+        let size = crate::utils::read_i32_le(self.data, file_off).unwrap_or(0);
         // Allocated cells have negative size
         let abs_size = size.unsigned_abs() as usize;
         if abs_size < 4 || file_off + abs_size > self.data.len() {
@@ -82,14 +99,14 @@ impl<'a> Hive<'a> {
 impl<'a> Key<'a> {
     /// Navigate to a subkey by name (case-insensitive ASCII).
     pub fn subkey(&self, hive: &Hive<'a>, name: &str) -> Result<Key<'a>> {
-        let subkey_count = u32_at(self.data, self.cell_offset + 0x14);
+        let subkey_count = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEY_COUNT);
         if subkey_count == 0 {
             return Err(hive_err(&format!(
                 "Key has no subkeys, looking for '{}'",
                 name
             )));
         }
-        let subkeys_list_offset = u32_at(self.data, self.cell_offset + 0x1C);
+        let subkeys_list_offset = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEYS_LIST);
         if subkeys_list_offset == 0xFFFF_FFFF {
             return Err(hive_err(&format!(
                 "No subkeys list, looking for '{}'",
@@ -102,11 +119,11 @@ impl<'a> Key<'a> {
 
     /// Enumerate all subkeys.
     pub fn subkeys(&self, hive: &Hive<'a>) -> Result<Vec<Key<'a>>> {
-        let subkey_count = u32_at(self.data, self.cell_offset + 0x14) as usize;
+        let subkey_count = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEY_COUNT) as usize;
         if subkey_count == 0 {
             return Ok(Vec::new());
         }
-        let subkeys_list_offset = u32_at(self.data, self.cell_offset + 0x1C);
+        let subkeys_list_offset = u32_at(self.data, self.cell_offset + NK_OFF_SUBKEYS_LIST);
         if subkeys_list_offset == 0xFFFF_FFFF {
             return Ok(Vec::new());
         }
@@ -116,8 +133,8 @@ impl<'a> Key<'a> {
 
     /// Read a binary value by name.
     pub fn value(&self, hive: &Hive<'a>, name: &str) -> Result<Vec<u8>> {
-        let value_count = u32_at(self.data, self.cell_offset + 0x24);
-        let values_list_offset = u32_at(self.data, self.cell_offset + 0x28);
+        let value_count = u32_at(self.data, self.cell_offset + NK_OFF_VALUE_COUNT);
+        let values_list_offset = u32_at(self.data, self.cell_offset + NK_OFF_VALUES_LIST);
         if value_count == 0 || values_list_offset == 0xFFFF_FFFF {
             return Err(hive_err(&format!("No values, looking for '{}'", name)));
         }
@@ -129,7 +146,7 @@ impl<'a> Key<'a> {
             }
             let vk_offset = u32_at(list_data, i * 4);
             let vk_file_off = HBIN_BASE + vk_offset as usize + 4; // skip cell size
-            if vk_file_off + 0x14 > self.data.len() {
+            if vk_file_off + VK_OFF_NAME > self.data.len() {
                 continue;
             }
             let vk_sig = u16_at(self.data, vk_file_off);
@@ -137,9 +154,9 @@ impl<'a> Key<'a> {
                 // "vk" as u16 LE
                 continue;
             }
-            let name_len = u16_at(self.data, vk_file_off + 0x02) as usize;
-            let vk_name = if name_len > 0 && vk_file_off + 0x14 + name_len <= self.data.len() {
-                std::str::from_utf8(&self.data[vk_file_off + 0x14..vk_file_off + 0x14 + name_len])
+            let name_len = u16_at(self.data, vk_file_off + VK_OFF_NAME_LEN) as usize;
+            let vk_name = if name_len > 0 && vk_file_off + VK_OFF_NAME + name_len <= self.data.len() {
+                std::str::from_utf8(&self.data[vk_file_off + VK_OFF_NAME..vk_file_off + VK_OFF_NAME + name_len])
                     .unwrap_or("")
             } else {
                 ""
@@ -149,8 +166,8 @@ impl<'a> Key<'a> {
                 continue;
             }
 
-            let data_size_raw = u32_at(self.data, vk_file_off + 0x04);
-            let data_offset = u32_at(self.data, vk_file_off + 0x08);
+            let data_size_raw = u32_at(self.data, vk_file_off + VK_OFF_DATA_SIZE);
+            let data_offset = u32_at(self.data, vk_file_off + VK_OFF_DATA_OFFSET);
             let is_inline = data_size_raw & 0x8000_0000 != 0;
             let data_size = (data_size_raw & 0x7FFF_FFFF) as usize;
 
@@ -181,13 +198,13 @@ impl<'a> Key<'a> {
                 data.len()
             )));
         }
-        Ok(u32::from_le_bytes(data[..4].try_into().unwrap()))
+        Ok(crate::utils::read_u32_le(&data, 0).unwrap_or(0))
     }
 
     /// Read the class name associated with this key.
     pub fn class_name(&self, hive: &Hive<'a>) -> Result<String> {
-        let class_offset = u32_at(self.data, self.cell_offset + 0x30);
-        let class_len = u16_at(self.data, self.cell_offset + 0x4A) as usize;
+        let class_offset = u32_at(self.data, self.cell_offset + NK_OFF_CLASS_OFFSET);
+        let class_len = u16_at(self.data, self.cell_offset + NK_OFF_CLASS_LEN) as usize;
         if class_offset == 0xFFFF_FFFF || class_len == 0 {
             return Err(hive_err("No class name"));
         }
@@ -199,11 +216,7 @@ impl<'a> Key<'a> {
 
         // Class name is typically UTF-16LE
         if class_len >= 2 && class_len.is_multiple_of(2) {
-            let u16s: Vec<u16> = cell[..class_len]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            Ok(String::from_utf16_lossy(&u16s))
+            Ok(crate::utils::utf16le_decode(&cell[..class_len]))
         } else {
             // ASCII fallback
             Ok(String::from_utf8_lossy(&cell[..class_len]).into_owned())
@@ -212,11 +225,11 @@ impl<'a> Key<'a> {
 
     /// Get the key name.
     pub fn name(&self) -> &str {
-        let name_len = u16_at(self.data, self.cell_offset + 0x48) as usize;
-        if name_len == 0 || self.cell_offset + 0x4C + name_len > self.data.len() {
+        let name_len = u16_at(self.data, self.cell_offset + NK_OFF_NAME_LEN) as usize;
+        if name_len == 0 || self.cell_offset + NK_OFF_NAME + name_len > self.data.len() {
             return "";
         }
-        std::str::from_utf8(&self.data[self.cell_offset + 0x4C..self.cell_offset + 0x4C + name_len])
+        std::str::from_utf8(&self.data[self.cell_offset + NK_OFF_NAME..self.cell_offset + NK_OFF_NAME + name_len])
             .unwrap_or("")
     }
 
@@ -341,14 +354,14 @@ impl<'a> Key<'a> {
     }
 }
 
-fn hive_err(msg: &str) -> GovmemError {
-    GovmemError::DecryptionError(format!("Hive: {}", msg))
+fn hive_err(msg: &str) -> VmkatzError {
+    VmkatzError::DecryptionError(format!("Hive: {}", msg))
 }
 
 fn u16_at(data: &[u8], off: usize) -> u16 {
-    u16::from_le_bytes(data[off..off + 2].try_into().unwrap())
+    crate::utils::read_u16_le(data, off).unwrap_or(0)
 }
 
 fn u32_at(data: &[u8], off: usize) -> u32 {
-    u32::from_le_bytes(data[off..off + 4].try_into().unwrap())
+    crate::utils::read_u32_le(data, off).unwrap_or(0)
 }

@@ -1,8 +1,11 @@
 pub mod discover;
 #[cfg(feature = "sam")]
 pub mod disk;
+#[cfg(feature = "dump")]
 pub mod dump;
 pub mod error;
+pub mod minidump;
+pub mod utils;
 #[cfg(feature = "hyperv")]
 pub mod hyperv;
 pub mod lsass;

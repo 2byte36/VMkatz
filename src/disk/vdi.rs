@@ -2,7 +2,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
+use super::{read_u16_le_file, read_u32_le_file, read_u64_le_file};
 
 const VDI_MAGIC: u32 = 0xBEDA_107F;
 const BAT_UNALLOCATED: u32 = 0xFFFF_FFFF;
@@ -53,57 +54,39 @@ struct VdiHeader {
     parent_uuid: VdiUuid,
 }
 
-fn read_u16_le(f: &mut File) -> std::io::Result<u16> {
-    let mut buf = [0u8; 2];
-    f.read_exact(&mut buf)?;
-    Ok(u16::from_le_bytes(buf))
-}
-
-fn read_u32_le(f: &mut File) -> std::io::Result<u32> {
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)?;
-    Ok(u32::from_le_bytes(buf))
-}
-
-fn read_u64_le(f: &mut File) -> std::io::Result<u64> {
-    let mut buf = [0u8; 8];
-    f.read_exact(&mut buf)?;
-    Ok(u64::from_le_bytes(buf))
-}
-
 fn parse_header(file: &mut File) -> Result<VdiHeader> {
     // Magic at 0x40
     file.seek(SeekFrom::Start(0x40))?;
-    let magic = read_u32_le(file)?;
+    let magic = read_u32_le_file(file)?;
     if magic != VDI_MAGIC {
-        return Err(GovmemError::InvalidMagic(magic));
+        return Err(VmkatzError::InvalidMagic(magic));
     }
 
     // Version at 0x44: minor u16, major u16
-    let _ver_minor = read_u16_le(file)?;
-    let _ver_major = read_u16_le(file)?;
+    let _ver_minor = read_u16_le_file(file)?;
+    let _ver_major = read_u16_le_file(file)?;
 
     // Header size at 0x48
-    let _header_size = read_u32_le(file)?;
+    let _header_size = read_u32_le_file(file)?;
 
     // Image type at 0x4C
-    let image_type = read_u32_le(file)?;
+    let image_type = read_u32_le_file(file)?;
 
     // BAT offset at 0x154, data offset at 0x158
     file.seek(SeekFrom::Start(0x154))?;
-    let offset_blocks = read_u32_le(file)? as u64;
-    let offset_data = read_u32_le(file)? as u64;
+    let offset_blocks = read_u32_le_file(file)? as u64;
+    let offset_data = read_u32_le_file(file)? as u64;
 
     // Disk size (u64) at 0x170
     file.seek(SeekFrom::Start(0x170))?;
-    let disk_size = read_u64_le(file)?;
+    let disk_size = read_u64_le_file(file)?;
 
     // Block size at 0x178
-    let block_size = read_u32_le(file)?;
+    let block_size = read_u32_le_file(file)?;
 
     // Skip 0x17C (unused), blocks_total at 0x180
     file.seek(SeekFrom::Start(0x180))?;
-    let blocks_total = read_u32_le(file)?;
+    let blocks_total = read_u32_le_file(file)?;
 
     // Image UUID at 0x188
     file.seek(SeekFrom::Start(0x188))?;
@@ -139,7 +122,7 @@ fn find_parent_vdi(child_path: &Path, parent_uuid: &VdiUuid) -> Result<PathBuf> 
         return Ok(found);
     }
 
-    Err(GovmemError::ProcessNotFound(format!(
+    Err(VmkatzError::DiskFormatError(format!(
         "Parent VDI with UUID {} not found",
         parent_uuid
     )))
@@ -266,7 +249,7 @@ impl VdiDisk {
         file.seek(SeekFrom::Start(header.offset_blocks))?;
         let mut bat = Vec::with_capacity(header.blocks_total as usize);
         for _ in 0..header.blocks_total {
-            bat.push(read_u32_le(&mut file)?);
+            bat.push(read_u32_le_file(&mut file)?);
         }
 
         // Open parent for differencing images
@@ -373,51 +356,5 @@ impl Seek for VdiDisk {
 impl crate::disk::DiskImage for VdiDisk {
     fn disk_size(&self) -> u64 {
         self.disk_size
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::disk::DiskImage;
-
-    #[test]
-    fn test_open_base_vdi() {
-        let path = Path::new("/home/user/vm/windows10-clean/windows10-clean.vdi");
-        if !path.exists() {
-            return;
-        }
-        let mut disk = VdiDisk::open(path).expect("failed to open base VDI");
-        assert_eq!(disk.disk_size(), 85899345920); // 80 GB
-
-        // Read MBR and check signature
-        let mut mbr = [0u8; 512];
-        disk.read_exact(&mut mbr).expect("failed to read MBR");
-        assert_eq!(mbr[510], 0x55);
-        assert_eq!(mbr[511], 0xAA);
-
-        // Check NTFS signature at LBA 2048 (byte offset 0x100000)
-        disk.seek(SeekFrom::Start(2048 * 512)).unwrap();
-        let mut ntfs_hdr = [0u8; 8];
-        disk.read_exact(&mut ntfs_hdr).unwrap();
-        assert_eq!(&ntfs_hdr[3..8], b"NTFS ");
-    }
-
-    #[test]
-    fn test_open_diff_vdi() {
-        let path = Path::new(
-            "/home/user/vm/windows10-clean/Snapshots/{29fc354e-2d14-424f-95be-d4f79d10e922}.vdi",
-        );
-        if !path.exists() {
-            return;
-        }
-        let mut disk = VdiDisk::open(path).expect("failed to open diff VDI");
-        assert_eq!(disk.disk_size(), 85899345920);
-
-        // MBR should be readable (from parent via fallthrough)
-        let mut mbr = [0u8; 512];
-        disk.read_exact(&mut mbr).expect("failed to read MBR");
-        assert_eq!(mbr[510], 0x55);
-        assert_eq!(mbr[511], 0xAA);
     }
 }

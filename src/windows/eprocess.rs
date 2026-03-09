@@ -1,8 +1,9 @@
 use crate::error::Result;
 use crate::memory::PhysicalMemory;
-use crate::windows::offsets::EprocessOffsets;
+use crate::windows::offsets::{EprocessOffsets, WindowsBitness};
 
 /// Read EPROCESS fields from a physical address.
+/// Handles both x64 (8-byte) and x86 PAE (4-byte) field widths.
 pub struct EprocessReader<'a> {
     pub offsets: &'a EprocessOffsets,
 }
@@ -14,12 +15,19 @@ impl<'a> EprocessReader<'a> {
 
     /// Read the DirectoryTableBase (CR3/DTB) from an EPROCESS at the given physical address.
     pub fn read_dtb(&self, phys: &impl PhysicalMemory, eprocess_phys: u64) -> Result<u64> {
-        phys.read_phys_u64(eprocess_phys + self.offsets.directory_table_base)
+        match self.offsets.bitness {
+            WindowsBitness::X64 => phys.read_phys_u64(eprocess_phys + self.offsets.directory_table_base),
+            // PAE CR3 is 32-bit in EPROCESS but the actual value uses all 32 bits
+            WindowsBitness::X86Pae => Ok(phys.read_phys_u32(eprocess_phys + self.offsets.directory_table_base)? as u64),
+        }
     }
 
     /// Read the UniqueProcessId (PID) from an EPROCESS at the given physical address.
     pub fn read_pid(&self, phys: &impl PhysicalMemory, eprocess_phys: u64) -> Result<u64> {
-        phys.read_phys_u64(eprocess_phys + self.offsets.unique_process_id)
+        match self.offsets.bitness {
+            WindowsBitness::X64 => phys.read_phys_u64(eprocess_phys + self.offsets.unique_process_id),
+            WindowsBitness::X86Pae => Ok(phys.read_phys_u32(eprocess_phys + self.offsets.unique_process_id)? as u64),
+        }
     }
 
     /// Read the ImageFileName (15-byte ASCII) from an EPROCESS at the given physical address.
@@ -43,11 +51,17 @@ impl<'a> EprocessReader<'a> {
 
     /// Read the ActiveProcessLinks.Flink from an EPROCESS at the given physical address.
     pub fn read_flink(&self, phys: &impl PhysicalMemory, eprocess_phys: u64) -> Result<u64> {
-        phys.read_phys_u64(eprocess_phys + self.offsets.active_process_links)
+        match self.offsets.bitness {
+            WindowsBitness::X64 => phys.read_phys_u64(eprocess_phys + self.offsets.active_process_links),
+            WindowsBitness::X86Pae => Ok(phys.read_phys_u32(eprocess_phys + self.offsets.active_process_links)? as u64),
+        }
     }
 
     /// Read the PEB virtual address from an EPROCESS at the given physical address.
     pub fn read_peb(&self, phys: &impl PhysicalMemory, eprocess_phys: u64) -> Result<u64> {
-        phys.read_phys_u64(eprocess_phys + self.offsets.peb)
+        match self.offsets.bitness {
+            WindowsBitness::X64 => phys.read_phys_u64(eprocess_phys + self.offsets.peb),
+            WindowsBitness::X86Pae => Ok(phys.read_phys_u32(eprocess_phys + self.offsets.peb)? as u64),
+        }
     }
 }

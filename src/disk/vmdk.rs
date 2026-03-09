@@ -2,7 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::error::{GovmemError, Result};
+use crate::error::{VmkatzError, Result};
 
 const VMDK_MAGIC: u32 = 0x564D444B; // "KDMV" LE
 const SECTOR_SIZE: u64 = 512;
@@ -38,7 +38,7 @@ impl VmdkDisk {
         }
 
         let base_dir = path.parent().unwrap_or(Path::new("."));
-        let desc_text = std::fs::read_to_string(path).map_err(GovmemError::Io)?;
+        let desc_text = std::fs::read_to_string(path).map_err(VmkatzError::Io)?;
         let desc = parse_descriptor(&desc_text)?;
 
         let mut extents = Vec::new();
@@ -81,7 +81,7 @@ impl VmdkDisk {
         let numbered_extents = collect_extent_files(dir)?;
 
         if numbered_extents.is_empty() {
-            return Err(GovmemError::ProcessNotFound(
+            return Err(VmkatzError::DiskFormatError(
                 "No VMDK extent files found in directory".into(),
             ));
         }
@@ -150,23 +150,24 @@ impl VmdkDisk {
             let virtual_sector = pos / SECTOR_SIZE;
             let sector_off = pos % SECTOR_SIZE;
 
-            // Find which extent this sector belongs to
-            let ext = match self.extents.iter_mut().find(|e| {
-                virtual_sector >= e.start_sector && virtual_sector < e.start_sector + e.capacity
-            }) {
-                Some(e) => e,
-                None => {
-                    // Sector is in a gap between extents — zero-fill up to the
-                    // next extent's start or the end of the request.
-                    let next_start = self
-                        .extents
-                        .iter()
-                        .filter(|e| e.start_sector > virtual_sector)
-                        .map(|e| e.start_sector)
-                        .min();
-                    let gap_end_byte = match next_start {
-                        Some(s) => s * SECTOR_SIZE,
-                        None => self.disk_size,
+            // Find which extent this sector belongs to using binary search.
+            // Extents are sorted by start_sector, so partition_point gives us
+            // the first extent whose start_sector > virtual_sector; the candidate
+            // is the one just before that (if any).
+            let candidate_idx = self
+                .extents
+                .partition_point(|e| e.start_sector <= virtual_sector);
+            let ext = if candidate_idx > 0 {
+                let e = &mut self.extents[candidate_idx - 1];
+                if virtual_sector < e.start_sector + e.capacity {
+                    e
+                } else {
+                    // Sector falls in a gap after this extent — zero-fill up to
+                    // the next extent's start or the end of the request.
+                    let gap_end_byte = if candidate_idx < self.extents.len() {
+                        self.extents[candidate_idx].start_sector * SECTOR_SIZE
+                    } else {
+                        self.disk_size
                     };
                     let gap_remain = (gap_end_byte - pos) as usize;
                     let chunk = gap_remain.min(to_read - filled);
@@ -174,6 +175,18 @@ impl VmdkDisk {
                     filled += chunk;
                     continue;
                 }
+            } else {
+                // Before all extents — zero-fill up to first extent
+                let gap_end_byte = if self.extents.is_empty() {
+                    self.disk_size
+                } else {
+                    self.extents[0].start_sector * SECTOR_SIZE
+                };
+                let gap_remain = (gap_end_byte - pos) as usize;
+                let chunk = gap_remain.min(to_read - filled);
+                buf[filled..filled + chunk].fill(0);
+                filled += chunk;
+                continue;
             };
 
             let local_sector = virtual_sector - ext.start_sector;
@@ -374,7 +387,7 @@ fn parse_descriptor(text: &str) -> Result<Descriptor> {
             if parts.len() == 4 {
                 let sectors: u64 = parts[1]
                     .parse()
-                    .map_err(|_| GovmemError::ProcessNotFound("bad VMDK extent sectors".into()))?;
+                    .map_err(|_| VmkatzError::DiskFormatError("bad VMDK extent sectors".into()))?;
                 let filename = parts[3].trim_matches('"').to_string();
                 extent_files.push((sectors, filename));
             }
@@ -382,7 +395,7 @@ fn parse_descriptor(text: &str) -> Result<Descriptor> {
     }
 
     if extent_files.is_empty() {
-        return Err(GovmemError::ProcessNotFound(
+        return Err(VmkatzError::DiskFormatError(
             "no extents in VMDK descriptor".into(),
         ));
     }
@@ -394,20 +407,21 @@ fn parse_descriptor(text: &str) -> Result<Descriptor> {
 }
 
 fn open_extent(path: &Path, start_sector: u64, _declared_capacity: u64) -> Result<VmdkExtent> {
-    let mut file = File::open(path).map_err(GovmemError::Io)?;
+    let mut file = File::open(path).map_err(VmkatzError::Io)?;
 
     let mut hdr = [0u8; 0x48];
     file.read_exact(&mut hdr)?;
 
     let magic = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
     if magic != VMDK_MAGIC {
-        return Err(GovmemError::InvalidMagic(magic));
+        return Err(VmkatzError::InvalidMagic(magic));
     }
 
-    let capacity = u64::from_le_bytes(hdr[0x0C..0x14].try_into().unwrap());
-    let grain_size = u64::from_le_bytes(hdr[0x14..0x1C].try_into().unwrap());
-    let num_gtes_per_gt = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap());
-    let gd_offset_sectors = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap());
+    // SparseExtentHeader fields (VMDK format spec):
+    let capacity = u64::from_le_bytes(hdr[0x0C..0x14].try_into().unwrap());        // capacity (sectors)
+    let grain_size = u64::from_le_bytes(hdr[0x14..0x1C].try_into().unwrap());      // grainSize (sectors)
+    let num_gtes_per_gt = u32::from_le_bytes(hdr[0x2C..0x30].try_into().unwrap()); // numGTEsPerGT
+    let gd_offset_sectors = u64::from_le_bytes(hdr[0x38..0x40].try_into().unwrap()); // gdOffset (sectors)
 
     // Number of grain directory entries = ceil(capacity / grain_size / num_gtes_per_gt)
     let total_grains = capacity.div_ceil(grain_size);
@@ -459,7 +473,7 @@ fn is_binary_extent(path: &Path) -> bool {
 fn collect_extent_files(dir: &Path) -> Result<Vec<(u32, PathBuf)>> {
     let mut extents: Vec<(u32, PathBuf)> = Vec::new();
 
-    let entries = std::fs::read_dir(dir).map_err(GovmemError::Io)?;
+    let entries = std::fs::read_dir(dir).map_err(VmkatzError::Io)?;
     for entry in entries.flatten() {
         let path = entry.path();
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");

